@@ -1,0 +1,16 @@
+# Fresh repo, so normalize now rather than after CRLF has been committed.
+# Sources are stored LF in git and checked out with the platform's native
+# endings, which keeps CubeIDE and CubeMX happy on Windows.
+* text=auto
+
+# CubeMX rewrites these itself; leave them exactly as it writes them.
+*.ioc text eol=crlf
+*.ld  text eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+*.a   binary
+*.elf binary
+*.bin binary
+*.hex binary
