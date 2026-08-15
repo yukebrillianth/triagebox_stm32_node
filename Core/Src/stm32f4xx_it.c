@@ -61,10 +61,8 @@ extern I2C_HandleTypeDef hi2c2;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim10;
 /* USER CODE BEGIN EV */
-/* hi2c2 lives in i2c.c; the ESP32 link slave handlers at the bottom of this
- * file need it. CubeMX only emits externs for peripherals whose interrupts it
- * generated, and I2C2's is hand-written here. */
-extern I2C_HandleTypeDef hi2c2;
+/* I2C2 (the ESP32 link slave) is now ticked in the .ioc, so CubeMX emits both
+ * the extern above and I2C2_EV/ER_IRQHandler below. Nothing needed here. */
 /* USER CODE END EV */
 
 /******************************************************************************/

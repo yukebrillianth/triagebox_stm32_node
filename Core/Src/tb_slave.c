@@ -83,21 +83,16 @@ void tb_slave_init(void)
     }
 
     /*
-     * NVIC is enabled here, not by CubeMX: I2C2's global interrupt is not
-     * ticked in the .ioc, so MX_I2C2_Init never touches the NVIC. Without
-     * these two lines HAL_I2C_EnableListen_IT succeeds, the peripheral matches
-     * the address, and no interrupt is ever taken -- the master just sees
-     * timeouts.
+     * NVIC needs no code here: I2C2's global interrupt is ticked in the .ioc, so
+     * HAL_I2C_MspInit enables I2C2_EV/ER_IRQn -- and because HAL_I2C_Init calls
+     * MspInit, the DeInit/Init pair above leaves them enabled. (MspDeInit does
+     * disable them in between; that is fine, nothing is listening yet.)
      *
-     * Priority 0 matches every other interrupt in this firmware (all at 0), so
-     * this cannot preempt the 497.5 Hz ADC ISR and can be delayed by it by up
-     * to a few microseconds. That is exactly why the transmit buffer is
+     * Both sit at preempt priority 0, like every other interrupt in this
+     * firmware, so this cannot preempt the 497.5 Hz ADC ISR and can be delayed
+     * by it by a few microseconds. That is exactly why the transmit buffer is
      * pre-staged: the delay costs a little clock stretching, never wrong data.
      */
-    HAL_NVIC_SetPriority(I2C2_EV_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(I2C2_EV_IRQn);
-    HAL_NVIC_SetPriority(I2C2_ER_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(I2C2_ER_IRQn);
 
     if (HAL_I2C_EnableListen_IT(&hi2c2) != HAL_OK) {
         Error_Handler();
