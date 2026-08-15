@@ -32,6 +32,7 @@
 #include "LoRa.h"
 #include "dsp_utils.h"
 #include "max30102_for_stm32_hal.h"
+#include "rfid_pn532.h"
 #include "tb_buttons.h"
 #include "tb_regs.h"
 #include "tb_slave.h"
@@ -198,6 +199,38 @@ volatile uint32_t mon_cmds = 0;
  * field for it. */
 volatile uint8_t mon_priority = 0;
 volatile uint8_t mon_confidence = 0;
+
+/* ---- RFID (PN532 on I2C3) ------------------------------------------------ */
+/* The tag as ASCII hex, which is what goes on the wire and onto the ESP32's
+ * screen. Uppercase, no separators: "04A2B3C4". Not NUL-terminated on the wire,
+ * so rfid_ascii_len is authoritative. */
+static char rfid_ascii[TB_RFID_MAX];
+static uint8_t rfid_ascii_len;
+/* Set by TB_CMD_START_SCAN, cleared when a tag is found, when the ESP32 aborts,
+ * or when RFID_SCAN_WINDOW_MS expires.
+ *
+ * Why a retry window and not a single poll: the ESP32 asks to scan once, but the
+ * operator presents the card seconds later. One PN532 poll would look at an
+ * empty field, report NO_CARD and give up -- exactly what "nothing happened when
+ * I tapped the card" looks like.
+ *
+ * Why the window is bounded rather than waiting for TB_CMD_ABORT: the ESP32 does
+ * not send ABORT today. Without a deadline, a scan nobody completes would retry
+ * forever, and each attempt blocks the superloop ~120 ms, so the ECG and SpO2
+ * paths would stay permanently starved after one unanswered scan. The window is
+ * generous enough for a person to find their card and short enough that a
+ * forgotten scan heals itself. */
+#define RFID_SCAN_WINDOW_MS 30000u
+static uint8_t rfid_scanning;
+static uint32_t rfid_scan_started_ms;
+/* CubeMonitor view of the last scan. mon_rfid_status is a Pn532_Status:
+ * 0=IDLE 1=FOUND 2=NO_CARD 3=ERR_I2C 4=ERR_ABSENT 5=ERR_PROTO. A steady 4 means
+ * the module is not answering at all -- wrong bus mode strap, wiring or power. */
+volatile uint8_t mon_rfid_status = 0;
+volatile uint8_t mon_rfid_uid_len = 0;
+volatile uint8_t mon_rfid_uid[PN532_UID_MAX] = { 0 };
+volatile uint32_t mon_rfid_scans = 0;
+volatile uint32_t mon_rfid_found = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -205,6 +238,7 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void PackTelemetry(void);
 static void PublishToEsp32(void);
+static void ServiceRfid(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -319,6 +353,11 @@ int main(void)
 			ANALOG_CHANNEL_COUNT);
 	HAL_TIM_Base_Start(&htim2);
 
+	// RFID: PN532 on I2C3 (PA8 SCL / PB4 SDA). Bind only -- the module is
+	// probed lazily on the first scan, so a missing or mis-strapped reader costs
+	// nothing at boot and cannot stall startup.
+	Pn532_Bind(&hi2c3);
+
 	// ESP32 link: I2C2 slave at TB_I2C_SLAVE_ADDR. Last, so a master read that
 	// arrives immediately finds the sensors already streaming.
 	tb_buttons_init(&btn_state);
@@ -416,21 +455,41 @@ int main(void)
 			max30102_read_fifo(&hmax30102);
 		}
 
-		/* ---- ESP32 link ---- */
-		PublishToEsp32();
-
+		/* ---- ESP32 link ----
+		 *
+		 * Order matters: take the command first, so a START_SCAN arriving this
+		 * pass is serviced this pass, and publish last, so the tag it found is
+		 * in the very next snapshot the ESP32 reads. The other way round costs
+		 * two full loops of latency on every scan. */
 		{
 			uint8_t cmd = tb_slave_take_cmd();
 			if (cmd != TB_CMD_NONE) {
-				/* Counted and latched only. Acting on these (gating the measure
-				 * window on START_MEASURE, parking sensors on POWER_OFF) is the
-				 * next commit; proving the link works in both directions comes
-				 * first, and a half-wired command that silently does nothing is
-				 * worse than one that visibly does nothing. */
+				/* START_SCAN is acted on; the rest are still latched only.
+				 * Gating the measure window on START_MEASURE and parking sensors
+				 * on POWER_OFF is the next step -- a half-wired command that
+				 * silently does nothing is worse than one that visibly does. */
+				if (cmd == TB_CMD_START_SCAN) {
+					/* Clear the published tag before scanning. Without this the
+					 * previous patient's card is still in the snapshot when the
+					 * ESP32 opens its scanning screen, and the scan "succeeds"
+					 * instantly on a stale identifier -- the worst possible
+					 * failure mode here, since it attaches one patient's
+					 * telemetry to another's ID. */
+					rfid_ascii_len = 0U;
+					rfid_scanning = 1U;
+					rfid_scan_started_ms = HAL_GetTick();
+				} else if (cmd == TB_CMD_ABORT) {
+					rfid_scanning = 0U;
+				}
 				mon_last_cmd = cmd;
 				++mon_cmds;
 			}
 		}
+
+		ServiceRfid();
+
+		PublishToEsp32();
+
 		{
 			uint8_t prio;
 			uint8_t conf;
@@ -584,6 +643,82 @@ static void PackTelemetry(void) {
 	memcpy(send_data, &lora_send_data_struct, sizeof(lora_send_data_struct));
 }
 
+/* Keeps a requested RFID scan running and converts a found UID to the ASCII hex
+ * the wire carries. Returns immediately when no scan is pending, so the cost in
+ * the common case is one flag test.
+ *
+ * Retries every pass while a scan is pending, up to RFID_SCAN_WINDOW_MS, because
+ * the ESP32 asks once but the operator taps the card seconds later -- one poll of
+ * an empty field would just report NO_CARD and give up. Stops on the first tag
+ * found, so a card left on the reader is not read repeatedly.
+ *
+ * Each attempt blocks for up to ~120 ms inside Pn532_Service, which is safe here
+ * for the reason its header documents: ADC and PPG samples arrive by interrupt,
+ * so a stalled superloop delays processing rather than losing data, and the
+ * margin is the 4 s ECG window. Note that the ESP32's snapshot poll also pauses
+ * for that long -- its 2 s frozen-seq warning has plenty of headroom, but this
+ * is why scanning is request-scoped and not a background free-run.
+ *
+ * Why ASCII rather than the raw bytes: TB_REG_RFID is a char array the ESP32
+ * puts straight on the screen and into its session record, and a 4-byte binary
+ * UID containing 0x00 would truncate there. Hex is twice as long and always
+ * printable. 10-byte UIDs give 20 characters, well inside TB_RFID_MAX (31).
+ *
+ * The tag is then STICKY: it keeps being published until the next START_SCAN
+ * clears it. The ESP32 consumes it as a one-shot (ui_mock_rfid_ready clears its
+ * own copy), so the card does not have to stay in the field while the operator
+ * works through the following screens. */
+static void ServiceRfid(void) {
+	Pn532_Tag tag;
+	uint8_t status;
+
+	if (!rfid_scanning) {
+		return; /* idle; leave the previously published tag in place */
+	}
+
+	/* Subtraction, not (start + window) > now: HAL_GetTick wraps at 2^32 ms and
+	 * unsigned subtraction stays correct across the wrap. */
+	if ((HAL_GetTick() - rfid_scan_started_ms) >= RFID_SCAN_WINDOW_MS) {
+		rfid_scanning = 0U;
+		return;
+	}
+
+	Pn532_RequestScan();
+	status = Pn532_Service(&tag);
+
+	++mon_rfid_scans;
+	mon_rfid_status = status;
+
+	if (status != PN532_FOUND) {
+		/* Keep retrying, and deliberately keep rfid_ascii: a failed poll must
+		 * not blank an identifier the operator is already looking at.
+		 * mon_rfid_status is where the failure is visible -- a steady 4
+		 * (ERR_ABSENT) means the module is not answering at all. */
+		return;
+	}
+
+	rfid_scanning = 0U;
+	++mon_rfid_found;
+	mon_rfid_uid_len = tag.uid_len;
+	for (uint8_t i = 0; i < PN532_UID_MAX; ++i) {
+		mon_rfid_uid[i] = (i < tag.uid_len) ? tag.uid[i] : 0U;
+	}
+	lora_send_data_struct.rfid_uid = tag.uid_hash;
+
+	static const char k_hex[] = "0123456789ABCDEF";
+	/* Two hex characters per UID byte always fits: the longest UID ISO14443-3
+	 * allows is 10 bytes = 20 characters, and TB_REG_RFID holds 31. Asserted at
+	 * compile time rather than clamped at run time, so if either constant ever
+	 * moves the build fails instead of silently truncating an identifier. */
+	_Static_assert((PN532_UID_MAX * 2U) <= TB_RFID_MAX,
+			"UID hex does not fit TB_REG_RFID");
+	for (uint8_t i = 0; i < tag.uid_len; ++i) {
+		rfid_ascii[i * 2U] = k_hex[(tag.uid[i] >> 4) & 0x0FU];
+		rfid_ascii[(i * 2U) + 1U] = k_hex[tag.uid[i] & 0x0FU];
+	}
+	rfid_ascii_len = (uint8_t) (tag.uid_len * 2U);
+}
+
 /* Polls the buttons and hands the ESP32 a fresh snapshot. Called every superloop
  * pass (~10ms), which sets both the button response time and the rate at which
  * the sequence counter advances.
@@ -638,7 +773,13 @@ static void PublishToEsp32(void) {
 	if (lora_status == LORA_OK) {
 		sensors |= TB_SENSOR_LORA;
 	}
-	/* TB_SENSOR_RFID stays clear: rfid_pn532.c is written but not in the build. */
+	/* RFID health is "the module answered", not "a card is present": an empty
+	 * field is the normal state and must not show as a dead sensor on the
+	 * ESP32's status dots. PN532_ERR_* and the never-scanned IDLE both leave it
+	 * clear, so the dot only lights once the reader has actually been reached. */
+	if ((mon_rfid_status == PN532_FOUND) || (mon_rfid_status == PN532_NO_CARD)) {
+		sensors |= TB_SENSOR_RFID;
+	}
 
 	tb_slave_publish(flags, mon_buttons, mon_hr_bpm,
 			(uint16_t) (mon_spo2_pct + 0.5f),
@@ -646,7 +787,7 @@ static void PublishToEsp32(void) {
 			0U, /* bp_sys: no source yet */
 			0U, /* bp_dia: no source yet */
 			0xFFU, /* battery: not measured on this board */
-			sensors, NULL, 0U);
+			sensors, rfid_ascii, rfid_ascii_len);
 }
 /* USER CODE END 4 */
 
