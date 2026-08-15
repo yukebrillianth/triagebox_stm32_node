@@ -60,7 +60,10 @@ extern ADC_HandleTypeDef hadc1;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim10;
 /* USER CODE BEGIN EV */
-
+/* hi2c2 lives in i2c.c; the ESP32 link slave handlers at the bottom of this
+ * file need it. CubeMX only emits externs for peripherals whose interrupts it
+ * generated, and I2C2's is hand-written here. */
+extern I2C_HandleTypeDef hi2c2;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -272,5 +275,35 @@ void DMA2_Stream0_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/**
+  * @brief I2C2 event interrupt -- ESP32 link slave (see tb_slave.c).
+  *
+  * Hand-written rather than CubeMX-generated: I2C2's global interrupt is not
+  * ticked in the .ioc, so CubeMX emits no handler and the weak alias in
+  * startup_stm32f411ceux.s traps into Default_Handler instead. Defining it here
+  * overrides that alias, and living inside a USER CODE block means a CubeMX
+  * regeneration will not delete it.
+  *
+  * IF YOU EVER TICK "I2C2 global interrupt" IN THE .ioc, delete these two
+  * functions in the same commit -- CubeMX will generate its own copies and the
+  * build fails with a duplicate symbol.
+  */
+void I2C2_EV_IRQHandler(void)
+{
+  HAL_I2C_EV_IRQHandler(&hi2c2);
+}
+
+/**
+  * @brief I2C2 error interrupt -- ESP32 link slave.
+  *
+  * Must exist. Without it a bus glitch (or the normal end-of-read NACK, which
+  * the F4 HAL reports as an AF error) leaves the peripheral out of listen mode
+  * and the slave stops answering, with no other symptom.
+  */
+void I2C2_ER_IRQHandler(void)
+{
+  HAL_I2C_ER_IRQHandler(&hi2c2);
+}
 
 /* USER CODE END 1 */

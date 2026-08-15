@@ -32,6 +32,9 @@
 #include "LoRa.h"
 #include "dsp_utils.h"
 #include "max30102_for_stm32_hal.h"
+#include "tb_buttons.h"
+#include "tb_regs.h"
+#include "tb_slave.h"
 //#include "filter_1.h"
 /* USER CODE END Includes */
 
@@ -178,12 +181,30 @@ volatile uint32_t mon_spo2_rejects = 0;
 volatile uint32_t mon_adc_samples = 0;
 volatile uint32_t mon_ecg_windows = 0;
 volatile uint32_t mon_lora_frames = 0;
+
+/* ---- ESP32 I2C link ----------------------------------------------------- */
+/* Debounce state for the 4 front-panel buttons. The published byte is
+ * mon_buttons (1 = pressed, bit0 = BUTTON_1); watch it in CubeMonitor to check
+ * wiring without needing the ESP32 attached. */
+static tb_buttons_t btn_state;
+volatile uint8_t mon_buttons = 0;
+/* Last command the ESP32 asked for, latched for visibility. Acting on these is
+ * the next step; right now they are only counted so the link can be proven in
+ * both directions before any behaviour depends on it. */
+volatile uint8_t mon_last_cmd = 0;
+volatile uint32_t mon_cmds = 0;
+/* Triage result written back by the ESP32 (LoRa order: 0=BLACK 1=RED 2=YELLOW
+ * 3=GREEN). Not yet placed in the LoRa packet -- the 14-byte struct has no
+ * field for it. */
+volatile uint8_t mon_priority = 0;
+volatile uint8_t mon_confidence = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void PackTelemetry(void);
+static void PublishToEsp32(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -297,6 +318,12 @@ int main(void)
 	HAL_ADC_Start_DMA(&hadc1, (uint32_t *) (void *) analog_data,
 			ANALOG_CHANNEL_COUNT);
 	HAL_TIM_Base_Start(&htim2);
+
+	// ESP32 link: I2C2 slave at TB_I2C_SLAVE_ADDR. Last, so a master read that
+	// arrives immediately finds the sensors already streaming.
+	tb_buttons_init(&btn_state);
+	tb_slave_init();
+	PublishToEsp32();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -387,6 +414,34 @@ int main(void)
 			max30102_interrupt_handler(&hmax30102);
 		} else {
 			max30102_read_fifo(&hmax30102);
+		}
+
+		/* ---- ESP32 link ---- */
+		PublishToEsp32();
+
+		{
+			uint8_t cmd = tb_slave_take_cmd();
+			if (cmd != TB_CMD_NONE) {
+				/* Counted and latched only. Acting on these (gating the measure
+				 * window on START_MEASURE, parking sensors on POWER_OFF) is the
+				 * next commit; proving the link works in both directions comes
+				 * first, and a half-wired command that silently does nothing is
+				 * worse than one that visibly does nothing. */
+				mon_last_cmd = cmd;
+				++mon_cmds;
+			}
+		}
+		{
+			uint8_t prio;
+			uint8_t conf;
+			if (tb_slave_take_result(&prio, &conf)) {
+				/* Nowhere to put these yet: LoRa_SendData is 14 packed bytes
+				 * with no priority field, and widening it is a station-side
+				 * change too. Held here so the round trip is observable in
+				 * CubeMonitor. */
+				mon_priority = prio;
+				mon_confidence = conf;
+			}
 		}
 
 		HAL_Delay(10);
@@ -527,6 +582,71 @@ void max30102_plot(uint32_t ir_sample, uint32_t red_sample) {
  * rather than a mix of old and new readings. */
 static void PackTelemetry(void) {
 	memcpy(send_data, &lora_send_data_struct, sizeof(lora_send_data_struct));
+}
+
+/* Polls the buttons and hands the ESP32 a fresh snapshot. Called every superloop
+ * pass (~10ms), which sets both the button response time and the rate at which
+ * the sequence counter advances.
+ *
+ * Reads the mon_* globals rather than taking arguments: they are already the
+ * one place every produced value lands, so a second parameter list would be a
+ * second thing to keep in sync. They are volatile and not read atomically, so a
+ * float could in principle tear; only the integers below go on the wire, and a
+ * 16-bit load on Cortex-M4 is single-instruction. */
+static void PublishToEsp32(void) {
+	uint8_t pins = 0;
+	uint8_t flags = 0;
+	uint8_t sensors = 0;
+
+	/* Raw pin levels, LSB = BUTTON_1. Pressed reads LOW (input + pull-up);
+	 * tb_buttons_poll owns that inversion, so nothing here knows about it. */
+	if (HAL_GPIO_ReadPin(BUTTON_1_GPIO_Port, BUTTON_1_Pin) == GPIO_PIN_SET) {
+		pins |= 0x01U;
+	}
+	if (HAL_GPIO_ReadPin(BUTTON_2_GPIO_Port, BUTTON_2_Pin) == GPIO_PIN_SET) {
+		pins |= 0x02U;
+	}
+	if (HAL_GPIO_ReadPin(BUTTON_3_GPIO_Port, BUTTON_3_Pin) == GPIO_PIN_SET) {
+		pins |= 0x04U;
+	}
+	if (HAL_GPIO_ReadPin(BUTTON_4_GPIO_Port, BUTTON_4_Pin) == GPIO_PIN_SET) {
+		pins |= 0x08U;
+	}
+	mon_buttons = tb_buttons_poll(&btn_state, pins);
+
+	/* Per-vital validity. A zero reading means "no reading" in every one of
+	 * these, which is why each gets its own bit: a finger off the MAX30102
+	 * must not invalidate a perfectly good ECG heart rate. */
+	if (mon_hr_bpm > 0U) {
+		flags |= TB_FLAG_HR_VALID;
+		sensors |= TB_SENSOR_ECG;
+	}
+	if (mon_spo2_valid != 0U) {
+		flags |= TB_FLAG_SPO2_VALID;
+	}
+	if (mon_spo2_pct > 0.0f) {
+		sensors |= TB_SENSOR_MAX30102;
+	}
+	if (mon_resp_brpm > 0.0f) {
+		flags |= TB_FLAG_RR_VALID;
+		sensors |= TB_SENSOR_MIC;
+	}
+	/* TB_FLAG_BP_VALID stays clear and BP stays 0: nothing measures pressure.
+	 * PA2 is the breathing microphone now, so the MPX5010 path is gone. The
+	 * ESP32's SVM uses BP as 2 of its 5 features and must see the bit clear
+	 * rather than believe a fabricated 0/0. */
+	if (lora_status == LORA_OK) {
+		sensors |= TB_SENSOR_LORA;
+	}
+	/* TB_SENSOR_RFID stays clear: rfid_pn532.c is written but not in the build. */
+
+	tb_slave_publish(flags, mon_buttons, mon_hr_bpm,
+			(uint16_t) (mon_spo2_pct + 0.5f),
+			(uint16_t) ((mon_resp_brpm * 10.0f) + 0.5f),
+			0U, /* bp_sys: no source yet */
+			0U, /* bp_dia: no source yet */
+			0xFFU, /* battery: not measured on this board */
+			sensors, NULL, 0U);
 }
 /* USER CODE END 4 */
 
