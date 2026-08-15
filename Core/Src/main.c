@@ -224,8 +224,10 @@ static uint8_t rfid_ascii_len;
 static uint8_t rfid_scanning;
 static uint32_t rfid_scan_started_ms;
 /* CubeMonitor view of the last scan. mon_rfid_status is a Pn532_Status:
- * 0=IDLE 1=FOUND 2=NO_CARD 3=ERR_I2C 4=ERR_ABSENT 5=ERR_PROTO. A steady 4 means
- * the module is not answering at all -- wrong bus mode strap, wiring or power. */
+ * 0=IDLE 1=FOUND 2=NO_CARD 3=ERR_I2C 4=ERR_ABSENT 5=ERR_PROTO. 4 means nothing
+ * ACKed address 0x24 at all -- bus mode strap, wiring or supply. 5 means it did
+ * ACK and then failed to answer properly, which points at the module's own
+ * power rail rather than the bus. */
 volatile uint8_t mon_rfid_status = 0;
 volatile uint8_t mon_rfid_uid_len = 0;
 volatile uint8_t mon_rfid_uid[PN532_UID_MAX] = { 0 };

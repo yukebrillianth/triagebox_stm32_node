@@ -30,8 +30,10 @@ typedef enum Pn532_Status {
 	PN532_FOUND = 1, /**< a tag was read; uid/uid_hash are valid */
 	PN532_NO_CARD = 2, /**< module answered, no tag in the field */
 	PN532_ERR_I2C = 3, /**< module ACKed once but a transfer failed */
-	PN532_ERR_ABSENT = 4, /**< no response: wrong bus mode, wiring or power */
-	PN532_ERR_PROTO = 5 /**< a reply arrived but was malformed */
+	PN532_ERR_ABSENT = 4, /**< address 0x24 never ACKed: bus mode, wiring, power */
+	PN532_ERR_PROTO = 5 /**< the module ACKed but its reply was wrong or absent:
+	                     *   right bus mode and wiring, wrong protocol state --
+	                     *   or a supply that collapses once the RF field runs */
 } Pn532_Status;
 
 typedef struct Pn532_Tag {

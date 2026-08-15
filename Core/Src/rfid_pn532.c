@@ -47,6 +47,11 @@
  * timeout ends the poll when one is not. */
 #define PN532_READY_TIMEOUT 100u
 
+/* Address-phase probes before giving up. More than one because the PN532 NACKs
+ * while it comes out of low-power state, so a single shot can fail on a module
+ * that is perfectly healthy a millisecond later. */
+#define PN532_PROBE_TRIES 3u
+
 /* Longest frame this driver ever receives: status + preamble/start (3) + LEN +
  * LCS + TFI + 0x4B + NbTg + Tg + SENS_RES(2) + SEL_RES + UID len + 10 UID +
  * DCS + postamble. 32 is comfortable and keeps the buffer off the heap. */
@@ -188,6 +193,22 @@ static uint8_t ParseHeader(const uint8_t *f, uint8_t f_len, uint8_t *payload_at)
 	return (uint8_t) (len - 1U); /* exclude TFI */
 }
 
+/**
+ * Address-phase-only check: does anything at 0x24 ACK?
+ *
+ * Worth separating from the handshake because the two failures look identical
+ * from the outside (both give PN532_ERR_ABSENT) but mean opposite things. A
+ * failing probe is hardware -- bus mode strap, wiring, supply. A passing probe
+ * with a failing handshake means the chip is on the bus and talking, and the
+ * problem is the frame protocol or a module that answers addressing while
+ * browning out under RF load. Guessing between those two costs hours.
+ */
+static uint8_t Probe(void)
+{
+	return (HAL_I2C_IsDeviceReady(pn_bus, PN532_I2C_ADDR, PN532_PROBE_TRIES,
+			PN532_I2C_TIMEOUT) == HAL_OK) ? 1U : 0U;
+}
+
 /** GetFirmwareVersion then SAMConfiguration: proves the module is there and
  *  puts it in normal reader mode with the watchdog off. */
 static uint8_t Handshake(void)
@@ -250,11 +271,19 @@ uint8_t Pn532_Service(Pn532_Tag *out)
 	}
 
 	if (!pn_configured) {
-		if (!Handshake()) {
+		/* Probe first so the two causes are distinguishable: no ACK at all is
+		 * ABSENT (hardware), an ACK followed by a failed handshake is PROTO. */
+		if (!Probe()) {
 			if (out != NULL) {
 				out->status = PN532_ERR_ABSENT;
 			}
 			return PN532_ERR_ABSENT;
+		}
+		if (!Handshake()) {
+			if (out != NULL) {
+				out->status = PN532_ERR_PROTO;
+			}
+			return PN532_ERR_PROTO;
 		}
 		pn_configured = 1;
 	}
