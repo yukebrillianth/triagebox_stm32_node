@@ -68,7 +68,6 @@ typedef enum Pn532_Status {
 typedef struct Pn532_Tag {
 	uint8_t uid[PN532_UID_MAX];
 	uint8_t uid_len; /**< 0 when no tag was read */
-	uint32_t uid_hash; /**< Pn532_HashUid(uid, uid_len), 0 when no tag */
 	uint8_t status; /**< Pn532_Status */
 } Pn532_Tag;
 
@@ -96,21 +95,24 @@ void Pn532_RequestScan(void);
 uint8_t Pn532_Service(Pn532_Tag *out);
 
 /**
- * FNV-1a over the UID, folding any length into 32 bits so the LoRa payload's
- * uint32_t rfid_uid field fits 7-byte and 10-byte UIDs as well as 4-byte ones.
+ * Packs the first 4 UID bytes into the LoRa payload's uint32_t, big-endian, so
+ * the number at the receiver reads the same left-to-right as the hex on the
+ * screen and on the card.
  *
- * The length is hashed in as well, so a 4-byte UID cannot collide with a
- * 7-byte UID that happens to share its first four bytes.
+ * This replaced an FNV-1a hash. The hash fitted any UID length into 32 bits
+ * without collisions, which is the mathematically tidier answer, but it was
+ * unreadable: the operator sees `04A2B7C1` on the LCD and the station logged
+ * some unrelated number, so nothing could be cross-checked by hand. Truncation
+ * is the honest trade -- the same 4 bytes everyone can see.
  *
- * Consequence to be aware of at the receiver: this is not the number printed
- * on the card, so it cannot be cross-checked by hand. mon_rfid_uid[] holds the
- * raw bytes for that. Being 32 bits, two different tags collide with ~50%
- * probability only once you have ~77000 of them in one dataset; for a triage
- * incident that is far beyond any realistic patient count.
+ * Consequence to keep in mind: two 7-byte NTAG UIDs sharing their first 4 bytes
+ * collide here. Real NXP UIDs put the manufacturer byte first and vary after,
+ * so this is unlikely rather than impossible; the full UID is on the I2C link
+ * either way, and the LoRa struct has no room for more.
  *
  * Returns 0 for a NULL or zero-length UID, so 0 always means "no tag".
  */
-uint32_t Pn532_HashUid(const uint8_t *uid, uint8_t len);
+uint32_t Pn532_PackUid(const uint8_t *uid, uint8_t len);
 
 /** Pn532_Stage the last attempt reached. Diagnostics only. */
 uint8_t Pn532_LastStage(void);

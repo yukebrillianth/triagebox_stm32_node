@@ -199,24 +199,31 @@ static void test_scan_read_fits(void)
     assert(PN532_RAW_MAX <= PN532_RX_MAX);
 }
 
-/* ---- UID hashing --------------------------------------------------------- */
+/* ---- UID packing --------------------------------------------------------- */
 
-static void test_hash_uid(void)
+static void test_pack_uid(void)
 {
-    const uint8_t a[4] = { 0xDEu, 0xADu, 0xBEu, 0xEFu };
-    const uint8_t b[7] = { 0xDEu, 0xADu, 0xBEu, 0xEFu, 0x01u, 0x02u, 0x03u };
+    const uint8_t a[4] = { 0x04u, 0xA2u, 0xB7u, 0xC1u };
+    const uint8_t b[7] = { 0x04u, 0xA2u, 0xB7u, 0xC1u, 0x01u, 0x02u, 0x03u };
+    const uint8_t s[2] = { 0xDEu, 0xADu };
 
-    /* 0 is reserved for "no tag", so a real UID must never hash to it. */
-    assert(Pn532_HashUid(a, sizeof(a)) != 0U);
-    assert(Pn532_HashUid(NULL, 4U) == 0U);
-    assert(Pn532_HashUid(a, 0U) == 0U);
+    /*
+     * Big-endian, so the hex of the packed value reads the same as the ASCII the
+     * screen shows. This is the whole point of dropping the hash -- if this
+     * assert ever needs "adjusting", the number stops matching the card.
+     */
+    assert(Pn532_PackUid(a, sizeof(a)) == 0x04A2B7C1u);
 
-    /* Deterministic, and length-sensitive: a 4-byte UID must not collide with a
-     * 7-byte one sharing its first four bytes. */
-    assert(Pn532_HashUid(a, sizeof(a)) == Pn532_HashUid(a, sizeof(a)));
-    assert(Pn532_HashUid(a, sizeof(a)) != Pn532_HashUid(b, sizeof(b)));
-    /* Same bytes, different claimed length. */
-    assert(Pn532_HashUid(b, 4U) != Pn532_HashUid(b, 5U));
+    /* A longer UID truncates to its first 4 bytes rather than folding, so the
+     * leading digits still match what the operator reads off the display. */
+    assert(Pn532_PackUid(b, sizeof(b)) == 0x04A2B7C1u);
+
+    /* Shorter than 4 left-aligns: 0xDEAD becomes 0x0000DEAD, not 0xDEAD0000. */
+    assert(Pn532_PackUid(s, sizeof(s)) == 0x0000DEADu);
+
+    /* 0 always means "no tag". */
+    assert(Pn532_PackUid(NULL, 4U) == 0U);
+    assert(Pn532_PackUid(a, 0U) == 0U);
 }
 
 int main(void)
@@ -226,7 +233,7 @@ int main(void)
     test_parse_header_tolerates_padding();
     test_parse_header_rejects();
     test_scan_read_fits();
-    test_hash_uid();
+    test_pack_uid();
 
     printf("pn532_selftest: all checks passed\n");
     return 0;

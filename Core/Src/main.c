@@ -725,7 +725,7 @@ static void ServiceRfid(void) {
 	for (uint8_t i = 0; i < PN532_UID_MAX; ++i) {
 		mon_rfid_uid[i] = (i < tag.uid_len) ? tag.uid[i] : 0U;
 	}
-	lora_send_data_struct.rfid_uid = tag.uid_hash;
+	lora_send_data_struct.rfid_uid = Pn532_PackUid(tag.uid, tag.uid_len);
 
 	static const char k_hex[] = "0123456789ABCDEF";
 	/* Two hex characters per UID byte always fits: the longest UID ISO14443-3

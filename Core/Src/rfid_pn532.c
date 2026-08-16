@@ -102,24 +102,21 @@ uint8_t Pn532_LastRaw(uint8_t *out, uint8_t max)
 	return n;
 }
 
-uint32_t Pn532_HashUid(const uint8_t *uid, uint8_t len)
+uint32_t Pn532_PackUid(const uint8_t *uid, uint8_t len)
 {
 	if (uid == NULL || len == 0U) {
 		return 0U;
 	}
-	/* FNV-1a, 32-bit. Chosen over a CRC because it is four lines and has no
-	 * table; UID collision resistance is all that is needed here. */
-	uint32_t h = 2166136261u;
-	for (uint8_t i = 0; i < len; ++i) {
-		h ^= (uint32_t) uid[i];
-		h *= 16777619u;
+	/* Big-endian over up to 4 bytes: uid[0] lands in the most significant byte,
+	 * so printing the result as hex gives the same digits in the same order as
+	 * the ASCII the ESP32 displays. A shorter UID left-aligns rather than
+	 * right-aligns for the same reason. */
+	uint32_t v = 0U;
+	const uint8_t n = (len < 4U) ? len : 4U;
+	for (uint8_t i = 0; i < n; ++i) {
+		v = (v << 8) | (uint32_t) uid[i];
 	}
-	/* Fold the length in so a 4-byte UID cannot collide with a 7-byte one
-	 * sharing its first four bytes. */
-	h ^= (uint32_t) len;
-	h *= 16777619u;
-	/* 0 is reserved for "no tag", so never return it. */
-	return (h == 0U) ? 1U : h;
+	return v;
 }
 
 /** Sends one command frame. @p body is TFI's payload: command byte then args. */
@@ -475,7 +472,6 @@ uint8_t Pn532_Service(Pn532_Tag *out)
 	if (out != NULL) {
 		memcpy(out->uid, &rx[rec + 5U], uid_len);
 		out->uid_len = uid_len;
-		out->uid_hash = Pn532_HashUid(out->uid, uid_len);
 		out->status = PN532_FOUND;
 	}
 	return PN532_FOUND;
