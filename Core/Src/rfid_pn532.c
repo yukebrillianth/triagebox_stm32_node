@@ -57,11 +57,23 @@
  * DCS + postamble. 32 is comfortable and keeps the buffer off the heap. */
 #define PN532_RX_MAX 32u
 
+/* What the scan actually asks ReadFrame for. One less than the buffer, because
+ * ReadFrame reads want+1 bytes to consume the leading I2C status byte. */
+#define PN532_SCAN_READ (PN532_RX_MAX - 1u)
+
 static I2C_HandleTypeDef *pn_bus;
 static volatile uint8_t pn_scan_requested;
 /* 0 until the module has answered GetFirmwareVersion once. Latched so the
  * handshake is not repeated on every scan. */
 static uint8_t pn_configured;
+
+/* Where the last attempt stopped, and the last bytes the module actually sent.
+ * Diagnostics only, but they are the difference between "the handshake failed"
+ * and knowing which of eleven steps failed and what arrived instead. Cheap
+ * enough to leave in permanently: one byte plus a 16-byte buffer. */
+static uint8_t pn_stage;
+static uint8_t pn_raw[PN532_RAW_MAX];
+static uint8_t pn_raw_len;
 
 void Pn532_Bind(I2C_HandleTypeDef *hi2c)
 {
@@ -73,6 +85,21 @@ void Pn532_Bind(I2C_HandleTypeDef *hi2c)
 void Pn532_RequestScan(void)
 {
 	pn_scan_requested = 1;
+}
+
+uint8_t Pn532_LastStage(void)
+{
+	return pn_stage;
+}
+
+uint8_t Pn532_LastRaw(uint8_t *out, uint8_t max)
+{
+	if (out == NULL || max == 0U) {
+		return 0;
+	}
+	const uint8_t n = (pn_raw_len < max) ? pn_raw_len : max;
+	memcpy(out, pn_raw, n);
+	return n;
 }
 
 uint32_t Pn532_HashUid(const uint8_t *uid, uint8_t len)
@@ -126,24 +153,22 @@ static uint8_t SendFrame(const uint8_t *body, uint8_t body_len)
 }
 
 /**
- * Reads @p want bytes once the module reports ready, into @p buf.
- * @p want excludes the leading I2C status byte, which is consumed here.
+ * Waits for the module's ready flag, reading only the one status byte.
+ *
+ * The previous version polled by attempting the whole read and discarding it
+ * when the flag was clear. That works on a compliant module but throws away a
+ * byte of the output buffer on every discarded attempt, so a module that sets
+ * ready mid-read can be left permanently one byte out of step. One byte in, one
+ * decision out.
  */
-static uint8_t ReadFrame(uint8_t *buf, uint8_t want, uint32_t timeout_ms)
+static uint8_t WaitReady(uint32_t timeout_ms)
 {
-	uint8_t raw[PN532_RX_MAX];
-	if ((uint32_t) want + 1U > sizeof(raw)) {
-		return 0;
-	}
-
 	const uint32_t start = HAL_GetTick();
 	do {
-		if (HAL_I2C_Master_Receive(pn_bus, PN532_I2C_ADDR, raw,
-				(uint16_t) (want + 1U), PN532_I2C_TIMEOUT) == HAL_OK) {
-			/* Bit 0 of the status byte is the ready flag. Anything read before
-			 * it is set is stale and must be discarded, not parsed. */
-			if ((raw[0] & 0x01u) != 0U) {
-				memcpy(buf, &raw[1], want);
+		uint8_t st = 0;
+		if (HAL_I2C_Master_Receive(pn_bus, PN532_I2C_ADDR, &st, 1U,
+				PN532_I2C_TIMEOUT) == HAL_OK) {
+			if ((st & 0x01u) != 0U) {
 				return 1;
 			}
 		}
@@ -154,42 +179,107 @@ static uint8_t ReadFrame(uint8_t *buf, uint8_t want, uint32_t timeout_ms)
 	return 0;
 }
 
-/** Consumes the 6-byte ACK frame 00 00 FF 00 FF 00 the module sends first. */
+/**
+ * Reads @p want bytes once the module reports ready, into @p buf.
+ * @p want excludes the leading I2C status byte, which is consumed here.
+ */
+static uint8_t ReadFrame(uint8_t *buf, uint8_t want, uint32_t timeout_ms)
+{
+	uint8_t raw[PN532_RX_MAX];
+	if ((uint32_t) want + 1U > sizeof(raw)) {
+		return 0;
+	}
+
+	if (!WaitReady(timeout_ms)) {
+		pn_raw_len = 0U; /* nothing arrived; do not leave the previous frame
+		                  * sitting in the diagnostics looking current */
+		return 0;
+	}
+	if (HAL_I2C_Master_Receive(pn_bus, PN532_I2C_ADDR, raw,
+			(uint16_t) (want + 1U), PN532_I2C_TIMEOUT) != HAL_OK) {
+		pn_raw_len = 0U;
+		return 0;
+	}
+
+	/* Keep what arrived before validating it -- when the parse fails, these are
+	 * the only bytes that say why. Status byte included, deliberately: a status
+	 * of 0x01 with junk behind it is a different fault from a status of 0x00. */
+	pn_raw_len = (want + 1U > PN532_RAW_MAX) ? PN532_RAW_MAX
+			: (uint8_t) (want + 1U);
+	memcpy(pn_raw, raw, pn_raw_len);
+
+	memcpy(buf, &raw[1], want);
+	return 1;
+}
+
+/**
+ * Finds the 0x00 0xFF start-code pair and returns the index of the 0xFF, or
+ * 0xFF if it is not there.
+ *
+ * The frame is documented as starting immediately, but the PN532 may emit
+ * padding zeros ahead of the preamble and clone modules routinely do. Assuming
+ * a fixed offset makes one stray leading byte look exactly like a dead module:
+ * the start-code test fails and the whole handshake is reported absent. Search,
+ * do not assume.
+ */
+static uint8_t FindStart(const uint8_t *f, uint8_t f_len)
+{
+	for (uint8_t i = 0; (uint8_t) (i + 1U) < f_len; ++i) {
+		if (f[i] == 0x00u && f[i + 1U] == 0xFFu) {
+			return (uint8_t) (i + 1U);
+		}
+	}
+	return 0xFFu;
+}
+
+/** Consumes the ACK frame 00 00 FF 00 FF 00 the module sends first. Read two
+ *  bytes longer than the frame so a padded ACK still contains all of it. */
 static uint8_t ReadAck(void)
 {
-	static const uint8_t expect[6] = { 0x00u, 0x00u, 0xFFu, 0x00u, 0xFFu,
-			0x00u };
-	uint8_t ack[6];
+	uint8_t ack[8];
 	if (!ReadFrame(ack, sizeof(ack), PN532_READY_TIMEOUT)) {
 		return 0;
 	}
-	return (memcmp(ack, expect, sizeof(expect)) == 0) ? 1U : 0U;
+	const uint8_t sc = FindStart(ack, sizeof(ack));
+	if (sc == 0xFFu || (uint8_t) (sc + 2U) >= sizeof(ack)) {
+		return 0;
+	}
+	/* After the start code an ACK is 00 FF, a NACK is FF 00. Only the former
+	 * means "command accepted". */
+	return (ack[sc + 1U] == 0x00u && ack[sc + 2U] == 0xFFu) ? 1U : 0U;
 }
 
 /**
  * Validates a response frame header and returns the payload length (the byte
- * count after TFI), or 0 if the frame is malformed.
+ * count after TFI), or 0 if the frame is malformed. Writes the payload offset
+ * to @p payload_at.
  */
 static uint8_t ParseHeader(const uint8_t *f, uint8_t f_len, uint8_t *payload_at)
 {
-	if (f_len < 7U) {
+	const uint8_t sc = FindStart(f, f_len);
+	if (sc == 0xFFu) {
 		return 0;
 	}
-	/* 00 00 FF LEN LCS TFI ... */
-	if (f[0] != 0x00u || f[1] != 0x00u || f[2] != 0xFFu) {
+	/* LEN, LCS and TFI follow the 0xFF, and at least one payload byte after. */
+	const uint8_t len_at = (uint8_t) (sc + 1U);
+	if ((uint32_t) len_at + 3U > f_len) {
 		return 0;
 	}
-	const uint8_t len = f[3];
-	if ((uint8_t) (len + f[4]) != 0x00u) {
+
+	const uint8_t len = f[len_at];
+	if ((uint8_t) (len + f[len_at + 1U]) != 0x00u) {
 		return 0; /* LEN + LCS must wrap to zero */
 	}
-	if (len < 1U || f[5] != PN532_PN532_TO_HOST) {
+	if (len < 1U || f[len_at + 2U] != PN532_PN532_TO_HOST) {
 		return 0;
 	}
-	if ((uint32_t) 6U + len > f_len) {
+	/* LEN counts TFI plus the payload, so the payload ends len-1 bytes after
+	 * TFI; all of it must be inside what was actually read. */
+	if ((uint32_t) len_at + 2U + len > f_len) {
 		return 0; /* frame claims more data than was read */
 	}
-	*payload_at = 6U;
+
+	*payload_at = (uint8_t) (len_at + 3U);
 	return (uint8_t) (len - 1U); /* exclude TFI */
 }
 
@@ -214,22 +304,27 @@ static uint8_t Probe(void)
 static uint8_t Handshake(void)
 {
 	uint8_t cmd = PN532_CMD_GET_FIRMWARE_VERSION;
+	pn_stage = PN532_STAGE_FW_SEND;
 	if (!SendFrame(&cmd, 1U)) {
 		return 0;
 	}
+	pn_stage = PN532_STAGE_FW_ACK;
 	if (!ReadAck()) {
 		return 0;
 	}
-	/* Reply: 00 00 FF 06 FA D5 03 IC Ver Rev Support DCS 00 */
-	uint8_t rx[14];
+	/* Reply: 00 00 FF 06 FA D5 03 IC Ver Rev Support DCS 00, plus slack for any
+	 * leading padding the module inserts. */
+	uint8_t rx[16];
+	pn_stage = PN532_STAGE_FW_READ;
 	if (!ReadFrame(rx, sizeof(rx), PN532_READY_TIMEOUT)) {
 		return 0;
 	}
 	uint8_t at = 0;
+	pn_stage = PN532_STAGE_FW_PARSE;
 	if (ParseHeader(rx, sizeof(rx), &at) < 2U) {
 		return 0;
 	}
-	if (rx[at + 1U] != (PN532_CMD_GET_FIRMWARE_VERSION + 1U)) {
+	if (rx[at] != (PN532_CMD_GET_FIRMWARE_VERSION + 1U)) {
 		return 0;
 	}
 
@@ -237,20 +332,28 @@ static uint8_t Handshake(void)
 	 * 0x01 = use IRQ pin. Sending it is required before InListPassiveTarget
 	 * will work reliably after a cold start. */
 	const uint8_t sam[4] = { PN532_CMD_SAM_CONFIGURATION, 0x01u, 0x14u, 0x01u };
+	pn_stage = PN532_STAGE_SAM_SEND;
 	if (!SendFrame(sam, sizeof(sam))) {
 		return 0;
 	}
+	pn_stage = PN532_STAGE_SAM_ACK;
 	if (!ReadAck()) {
 		return 0;
 	}
-	uint8_t sam_rx[9]; /* 00 00 FF 02 FE D5 15 DCS 00 */
+	uint8_t sam_rx[12]; /* 00 00 FF 02 FE D5 15 DCS 00 + padding slack */
+	pn_stage = PN532_STAGE_SAM_READ;
 	if (!ReadFrame(sam_rx, sizeof(sam_rx), PN532_READY_TIMEOUT)) {
 		return 0;
 	}
+	pn_stage = PN532_STAGE_SAM_PARSE;
 	if (ParseHeader(sam_rx, sizeof(sam_rx), &at) < 1U) {
 		return 0;
 	}
-	return (sam_rx[at] == (PN532_CMD_SAM_CONFIGURATION + 1U)) ? 1U : 0U;
+	if (sam_rx[at] != (PN532_CMD_SAM_CONFIGURATION + 1U)) {
+		return 0;
+	}
+	pn_stage = PN532_STAGE_READY;
+	return 1;
 }
 
 uint8_t Pn532_Service(Pn532_Tag *out)
@@ -273,6 +376,7 @@ uint8_t Pn532_Service(Pn532_Tag *out)
 	if (!pn_configured) {
 		/* Probe first so the two causes are distinguishable: no ACK at all is
 		 * ABSENT (hardware), an ACK followed by a failed handshake is PROTO. */
+		pn_stage = PN532_STAGE_PROBE;
 		if (!Probe()) {
 			if (out != NULL) {
 				out->status = PN532_ERR_ABSENT;
@@ -293,12 +397,14 @@ uint8_t Pn532_Service(Pn532_Tag *out)
 	 * wears one band. */
 	const uint8_t cmd[3] = { PN532_CMD_IN_LIST_PASSIVE_TARGET, 0x01u,
 			PN532_BRTY_ISO14443A };
+	pn_stage = PN532_STAGE_SCAN_SEND;
 	if (!SendFrame(cmd, sizeof(cmd))) {
 		if (out != NULL) {
 			out->status = PN532_ERR_I2C;
 		}
 		return PN532_ERR_I2C;
 	}
+	pn_stage = PN532_STAGE_SCAN_ACK;
 	if (!ReadAck()) {
 		if (out != NULL) {
 			out->status = PN532_ERR_I2C;
@@ -306,11 +412,19 @@ uint8_t Pn532_Service(Pn532_Tag *out)
 		return PN532_ERR_I2C;
 	}
 
-	/* Reply with one 4-byte-UID target is 20 bytes; a 7-byte UID is 23. Always
-	 * read the maximum: a short read would leave bytes in the module for the
-	 * next scan to trip over. */
+	/*
+	 * Reply with one 4-byte-UID target is 20 bytes; a 7-byte UID is 23. Read the
+	 * largest frame that fits, so a short read cannot leave bytes in the module
+	 * for the next scan to trip over.
+	 *
+	 * PN532_SCAN_READ is one less than the buffer because ReadFrame prepends the
+	 * I2C status byte. Asking for the full buffer made ReadFrame's own bounds
+	 * check fail, so the read never happened and every scan returned NO_CARD --
+	 * indistinguishable from an empty field, which is why it went unnoticed.
+	 */
 	uint8_t rx[PN532_RX_MAX];
-	if (!ReadFrame(rx, (uint8_t) sizeof(rx), PN532_READY_TIMEOUT)) {
+	pn_stage = PN532_STAGE_SCAN_READ;
+	if (!ReadFrame(rx, PN532_SCAN_READ, PN532_READY_TIMEOUT)) {
 		/* No response at all within the window. The module ends its own RF
 		 * poll, so this is the empty-field case, not a bus fault. */
 		if (out != NULL) {
@@ -320,7 +434,8 @@ uint8_t Pn532_Service(Pn532_Tag *out)
 	}
 
 	uint8_t at = 0;
-	const uint8_t payload = ParseHeader(rx, (uint8_t) sizeof(rx), &at);
+	pn_stage = PN532_STAGE_SCAN_PARSE;
+	const uint8_t payload = ParseHeader(rx, PN532_SCAN_READ, &at);
 	/* Payload: 4B NbTg [Tg SENS_RES(2) SEL_RES UIDLen UID...] = 2 minimum. */
 	if (payload < 2U || rx[at] != (PN532_CMD_IN_LIST_PASSIVE_TARGET + 1U)) {
 		if (out != NULL) {
@@ -335,9 +450,11 @@ uint8_t Pn532_Service(Pn532_Tag *out)
 		return PN532_NO_CARD;
 	}
 
-	/* Target record starts at at+2: Tg, SENS_RES hi/lo, SEL_RES, UIDLen, UID */
+	/* Target record starts at at+2: Tg, SENS_RES hi/lo, SEL_RES, UIDLen, UID.
+	 * Bounds are PN532_SCAN_READ, not sizeof(rx): only that many bytes were
+	 * filled, so the last byte of the buffer is uninitialised. */
 	const uint8_t rec = (uint8_t) (at + 2U);
-	if ((uint32_t) rec + 5U > sizeof(rx)) {
+	if ((uint32_t) rec + 5U > PN532_SCAN_READ) {
 		if (out != NULL) {
 			out->status = PN532_ERR_PROTO;
 		}
@@ -348,7 +465,7 @@ uint8_t Pn532_Service(Pn532_Tag *out)
 	 * attacker-controlled in the sense that any tag can claim any value, and a
 	 * bogus 0xFF would otherwise read past the buffer. */
 	if (uid_len == 0U || uid_len > PN532_UID_MAX
-			|| ((uint32_t) rec + 5U + uid_len) > sizeof(rx)) {
+			|| ((uint32_t) rec + 5U + uid_len) > PN532_SCAN_READ) {
 		if (out != NULL) {
 			out->status = PN532_ERR_PROTO;
 		}

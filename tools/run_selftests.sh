@@ -28,4 +28,15 @@ $CC $CFLAGS -I Core/Inc \
     -o "$OUT/tb_link_selftest"
 "$OUT/tb_link_selftest"
 
+# The PN532 parser needs a fake HAL: tools/pn532_selftest.c includes
+# tools/stub/main.h first, which claims main.h's include guard so the real one
+# (and the whole STM32 HAL behind it) expands to nothing. The test also
+# #includes rfid_pn532.c to reach the static parsing helpers.
+echo "==> pn532_selftest"
+# shellcheck disable=SC2086
+$CC $CFLAGS -I tools -I Core/Inc \
+    tools/pn532_selftest.c \
+    -o "$OUT/pn532_selftest"
+"$OUT/pn532_selftest"
+
 echo "All host selftests passed."

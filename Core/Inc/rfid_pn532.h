@@ -24,6 +24,35 @@
  *  NTAG/Ultralight, 10 is the theoretical maximum. */
 #define PN532_UID_MAX 10u
 
+/** Bytes of the last reply kept for inspection. 16 covers the longest handshake
+ *  frame, which is all that matters for diagnosing a handshake. */
+#define PN532_RAW_MAX 16u
+
+/**
+ * How far the last handshake attempt got. The status codes below say a
+ * handshake failed; this says which of its steps failed, which is the
+ * difference between a five-minute fix and an afternoon of guessing.
+ *
+ * Mirrored to mon_rfid_stage for CubeMonitor.
+ */
+typedef enum Pn532_Stage {
+	PN532_STAGE_NONE = 0, /**< never attempted */
+	PN532_STAGE_PROBE = 1, /**< address probe; failing here is hardware */
+	PN532_STAGE_FW_SEND = 2, /**< sending GetFirmwareVersion */
+	PN532_STAGE_FW_ACK = 3, /**< awaiting its ACK frame */
+	PN532_STAGE_FW_READ = 4, /**< awaiting its reply */
+	PN532_STAGE_FW_PARSE = 5, /**< reply arrived, validating it */
+	PN532_STAGE_SAM_SEND = 6, /**< sending SAMConfiguration */
+	PN532_STAGE_SAM_ACK = 7,
+	PN532_STAGE_SAM_READ = 8,
+	PN532_STAGE_SAM_PARSE = 9,
+	PN532_STAGE_READY = 10, /**< handshake complete; scanning from here on */
+	PN532_STAGE_SCAN_SEND = 11, /**< sending InListPassiveTarget */
+	PN532_STAGE_SCAN_ACK = 12,
+	PN532_STAGE_SCAN_READ = 13,
+	PN532_STAGE_SCAN_PARSE = 14
+} Pn532_Stage;
+
 /** Result of the last scan. Mirrored to mon_rfid_status for CubeMonitor. */
 typedef enum Pn532_Status {
 	PN532_IDLE = 0, /**< no scan requested since boot */
@@ -82,5 +111,18 @@ uint8_t Pn532_Service(Pn532_Tag *out);
  * Returns 0 for a NULL or zero-length UID, so 0 always means "no tag".
  */
 uint32_t Pn532_HashUid(const uint8_t *uid, uint8_t len);
+
+/** Pn532_Stage the last attempt reached. Diagnostics only. */
+uint8_t Pn532_LastStage(void);
+
+/**
+ * Copies up to @p max bytes of the last reply read from the module, including
+ * its leading I2C status byte, and returns how many were copied.
+ *
+ * Read this when a scan fails: a frame shifted by padding, a status byte of
+ * 0x00, and all-0xFF from an open bus are three different faults that the
+ * status code alone cannot tell apart.
+ */
+uint8_t Pn532_LastRaw(uint8_t *out, uint8_t max);
 
 #endif /* RFID_PN532_H */

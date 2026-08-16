@@ -231,6 +231,14 @@ static uint32_t rfid_scan_started_ms;
 volatile uint8_t mon_rfid_status = 0;
 volatile uint8_t mon_rfid_uid_len = 0;
 volatile uint8_t mon_rfid_uid[PN532_UID_MAX] = { 0 };
+/* Which handshake step the last attempt reached (Pn532_Stage), and the raw bytes
+ * of the last reply including its I2C status byte. Watch these together: the
+ * stage says where it stopped, the bytes say what arrived instead. All 0xFF is
+ * an open bus, a leading 0x00 status byte is "module not ready", and a frame
+ * that starts a byte or two in is padding the parser now tolerates. */
+volatile uint8_t mon_rfid_stage = 0;
+volatile uint8_t mon_rfid_raw[PN532_RAW_MAX] = { 0 };
+volatile uint8_t mon_rfid_raw_len = 0;
 volatile uint32_t mon_rfid_scans = 0;
 volatile uint32_t mon_rfid_found = 0;
 /* USER CODE END PV */
@@ -691,11 +699,23 @@ static void ServiceRfid(void) {
 	++mon_rfid_scans;
 	mon_rfid_status = status;
 
+	/* Mirror the diagnostics on every attempt, success or not: the stage after a
+	 * success is the useful baseline for reading the failures. */
+	mon_rfid_stage = Pn532_LastStage();
+	{
+		uint8_t raw[PN532_RAW_MAX];
+		const uint8_t n = Pn532_LastRaw(raw, sizeof(raw));
+		for (uint8_t i = 0; i < PN532_RAW_MAX; ++i) {
+			mon_rfid_raw[i] = (i < n) ? raw[i] : 0U;
+		}
+		mon_rfid_raw_len = n;
+	}
+
 	if (status != PN532_FOUND) {
 		/* Keep retrying, and deliberately keep rfid_ascii: a failed poll must
 		 * not blank an identifier the operator is already looking at.
-		 * mon_rfid_status is where the failure is visible -- a steady 4
-		 * (ERR_ABSENT) means the module is not answering at all. */
+		 * mon_rfid_status says what failed, mon_rfid_stage says where, and
+		 * mon_rfid_raw says what the module sent instead. */
 		return;
 	}
 
