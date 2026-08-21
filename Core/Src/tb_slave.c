@@ -35,6 +35,18 @@ static volatile tb_snapshot_t s_live;
  * even if the superloop publishes mid-transaction. */
 static uint8_t s_tx[sizeof(tb_snapshot_t)];
 
+/*
+ * PPG waveform ring, written by tb_slave_ppg_push() and latched into s_ppg_tx
+ * the same way s_live is. It needs the latch for the same reason: a 132-byte
+ * read takes ~12ms at 100kHz, which is long enough for a new sample to land on
+ * the slot the master is part-way through reading.
+ *
+ * volatile is doing real work here, not decoration -- see the store order in
+ * tb_slave_ppg_push().
+ */
+static volatile tb_ppg_block_t s_ppg;
+static uint8_t s_ppg_tx[sizeof(tb_ppg_block_t)];
+
 static volatile uint8_t s_ptr;         /* register pointer, auto-increments */
 static volatile bool s_ptr_valid;      /* false until the master writes one */
 static volatile uint8_t s_rx;          /* one-byte landing pad for writes */
@@ -62,6 +74,9 @@ void tb_slave_init(void)
 
     memcpy((void *)&s_live, &s_stage, sizeof(s_stage));
     memcpy(s_tx, &s_stage, sizeof(s_stage));
+
+    memset((void *)&s_ppg, 0, sizeof(s_ppg));
+    memset(s_ppg_tx, 0, sizeof(s_ppg_tx));
 
     s_ptr = 0U;
     s_ptr_valid = false;
@@ -132,6 +147,13 @@ void tb_slave_publish(uint8_t flags, uint8_t buttons, uint16_t hr,
     HAL_NVIC_EnableIRQ(I2C2_EV_IRQn);
 }
 
+void tb_slave_ppg_push(float ir, float red)
+{
+    /* All of it is in tb_regs.h, next to the layout it has to agree with, and
+     * host-tested there -- see tb_ppg_push() for why total is stored last. */
+    tb_ppg_push(&s_ppg, ir, red);
+}
+
 uint8_t tb_slave_take_cmd(void)
 {
     uint8_t cmd = s_cmd;
@@ -174,25 +196,32 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection,
         arm_receive();
     } else {
         uint8_t start = s_ptr_valid ? s_ptr : 0U;
+        uint8_t *src;
         uint16_t len;
 
-        /* Latch the snapshot now: this is the instant that makes a multi-byte
-         * read coherent. */
-        memcpy(s_tx, (const void *)&s_live, sizeof(s_tx));
-
-        if (start >= sizeof(s_tx)) {
-            /* Out-of-range pointer (or the write block, which is not
-             * readable). Feed 0xFF rather than leaking adjacent memory --
-             * 0xFF is also what an idle bus looks like, so it reads as
-             * "nothing here" on the master's console. */
+        /* Latch whichever block was addressed. This is the instant that makes a
+         * multi-byte read coherent, and only the block actually being read is
+         * copied -- the waveform block is 132 bytes and there is no reason to
+         * pay for it on a vitals poll. */
+        if (start < sizeof(s_tx)) {
+            memcpy(s_tx, (const void *)&s_live, sizeof(s_tx));
+            src = &s_tx[start];
+            len = (uint16_t)(sizeof(s_tx) - start);
+        } else if ((start >= TB_REG_PPG_BASE) && (start < TB_REG_PPG_END)) {
+            memcpy(s_ppg_tx, (const void *)&s_ppg, sizeof(s_ppg_tx));
+            src = &s_ppg_tx[start - TB_REG_PPG_BASE];
+            len = (uint16_t)(TB_REG_PPG_END - start);
+        } else {
+            /* Out-of-range pointer, or the write block, which is not readable.
+             * Feed 0xFF rather than leaking adjacent memory -- 0xFF is also
+             * what an idle bus looks like, so it reads as "nothing here" on the
+             * master's console. */
             static uint8_t pad = 0xFFU;
             (void)HAL_I2C_Slave_Seq_Transmit_IT(hi2c, &pad, 1U, I2C_LAST_FRAME);
             return;
         }
 
-        len = (uint16_t)(sizeof(s_tx) - start);
-        (void)HAL_I2C_Slave_Seq_Transmit_IT(hi2c, &s_tx[start], len,
-                                           I2C_LAST_FRAME);
+        (void)HAL_I2C_Slave_Seq_Transmit_IT(hi2c, src, len, I2C_LAST_FRAME);
     }
 }
 

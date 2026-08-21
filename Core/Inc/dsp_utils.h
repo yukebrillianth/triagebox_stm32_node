@@ -31,6 +31,19 @@
 #define DSP_RESP_HOP 25u
 /* 1.28s of PPG per SpO2 estimate. */
 #define DSP_PPG_BLOCK 128u
+/* PPG smoothing FIR: 31-tap Hamming lowpass, 10Hz corner at 100Hz.
+ * Linear phase is the reason this is an FIR and not another biquad: every
+ * frequency is delayed by exactly (31-1)/2 = 15 samples (150ms), so the shape
+ * and the relative timing of the systolic peak and dicrotic notch survive
+ * intact. A biquad shifts each frequency differently and quietly deforms
+ * exactly those features. Keep that property: the smoothed stream is what any
+ * downstream waveform analysis works from, here or on the ESP32.
+ * 10Hz corner: -40dB at 15Hz for only -0.10dB at 5Hz, i.e. flat through the
+ * 8th harmonic of a 75bpm pulse, so the hash goes and the pulse does not. A
+ * 15Hz corner is not available at this sample rate - 15Hz is 0.15 of 100Hz and
+ * a 31-tap design there has no stopband left below Nyquist.
+ * Verified in tools/ppg_fir_selftest.c. */
+#define DSP_PPG_LP_TAPS 31u
 /* Samples to discard after Dsp_Init before any block is trusted. The 0.5Hz DC
  * lowpass has a ~0.3s time constant, so from a cold start (state 0, input
  * jumping to tens of thousands of counts) it needs several seconds to settle,
@@ -38,7 +51,9 @@
  * a large bogus AC amplitude. Measured on the host: at 300 samples the residual
  * ring still gives a perfusion index of 0.0019, inside the plausible-pulse
  * range, so it would pass the gate as a false reading. 640 = 5 whole blocks
- * (6.4s), by which point the ring is 3 orders of magnitude down. */
+ * (6.4s), by which point the ring is 3 orders of magnitude down. The smoothing
+ * FIR adds DSP_PPG_LP_TAPS-1 = 30 samples of its own settling, still far
+ * inside this. */
 #define DSP_PPG_WARMUP 640u
 
 /* ---- Plausibility limits ------------------------------------------------ */
@@ -78,11 +93,26 @@
  * rather than a lead-off or flat trace. An AD8232 QRS is >100 LSB peak, so
  * 5 LSB is a generous floor that still rejects a bare noise floor. */
 #define DSP_ECG_MIN_RMS 5.0f
-/* SpO2 gates. DC floor rejects "no finger" (the MAX30102 reads a few hundred
- * counts of ambient with nothing on it, and 6.2mA through tissue gives tens of
- * thousands). Perfusion floor rejects a finger resting without pressure: a
- * real pulse is 0.5-2% AC/DC, so 0.05% is well below any true reading. */
-#define DSP_SPO2_MIN_DC 1000.0f
+/* Skin-contact floor, in raw counts. Below it there is no finger and NOTHING
+ * downstream may treat the waveform as a measurement: it gates the SpO2 DC
+ * check (DSP_SPO2_REJ_DC_LOW) and TB_FLAG_PPG_CONTACT, which is why it is one
+ * constant and not one per consumer -- two thresholds for the same physical
+ * question would eventually disagree, and the failure would be a plausible
+ * number on the screen with no finger on the sensor.
+ *
+ * 5000 comes from measurement on this board, not from the datasheet. With
+ * nothing on the sensor RED reads ~2000 counts (ambient plus detector noise);
+ * a seated finger reads 150000-180000, varying with position. So the two
+ * populations are 75x apart and any floor in between works -- 5000 sits 2.5x
+ * above the noise and 30x below the signal. The previous value of 1000 was
+ * BELOW the no-finger reading, so the DC gate passed on ambient light and the
+ * ESP32 was shown an SpO2 percentage derived from noise.
+ *
+ * Checked against RED rather than IR because tissue attenuates red far more,
+ * so RED is always the smaller of the two and therefore the binding channel. */
+#define DSP_PPG_MIN_DC 5000.0f
+/* Perfusion floor rejects a finger resting without pressure: a real pulse is
+ * 0.5-2% AC/DC, so 0.05% is well below any true reading. */
 #define DSP_SPO2_MIN_PI 0.0005f
 
 /* ---- SpO2 calibration --------------------------------------------------- */
@@ -102,7 +132,7 @@ typedef struct Dsp_EcgResult {
 typedef enum Dsp_Spo2Reject {
 	DSP_SPO2_OK = 0,
 	DSP_SPO2_REJ_NO_BLOCK = 1, /**< called before a block finished */
-	DSP_SPO2_REJ_DC_LOW = 2, /**< IR or RED DC under DSP_SPO2_MIN_DC */
+	DSP_SPO2_REJ_DC_LOW = 2, /**< RED or IR DC under DSP_PPG_MIN_DC: no finger */
 	DSP_SPO2_REJ_PERFUSION = 3, /**< AC/DC under DSP_SPO2_MIN_PI: no pulse */
 	DSP_SPO2_REJ_R_RANGE = 4, /**< ratio-of-ratios outside 0..3.4 */
 	DSP_SPO2_REJ_SPO2_LOW = 5, /**< result below the calibrated range */
@@ -184,10 +214,30 @@ float Dsp_RespRateBrpm(Dsp_RespDebug *dbg);
 
 /* ---- SpO2 --------------------------------------------------------------- */
 /**
- * Splits one IR/RED pair into DC (<0.5Hz) and AC (0.5-5Hz) components.
- * ISR-safe; call once per MAX30102 sample at DSP_PPG_FS_HZ.
+ * One PPG sample after the smoothing FIR. Filled by Dsp_Spo2PushSample so the
+ * cleaned waveform is available for plotting and for whatever downstream tier
+ * wants a usable waveform, which the raw MAX30102 stream is too hashy to be:
+ * ~25 counts of sample-to-sample noise on a ~200-count pulse.
  */
-void Dsp_Spo2PushSample(uint32_t ir, uint32_t red);
+typedef struct Dsp_PpgSample {
+	float ir; /**< smoothed IR, raw counts, baseline included */
+	float red; /**< smoothed RED, raw counts */
+	/** Smoothed IR minus its 0.5Hz baseline: the pulse waveform, centred on
+	 *  zero. Preferred over the 0.5-5Hz AC output when the SHAPE matters - the
+	 *  AC biquad's phase response varies across the pulse's own harmonics,
+	 *  whereas subtracting a slow baseline leaves the FIR's linear phase
+	 *  intact above ~1Hz. */
+	float pulse;
+} Dsp_PpgSample;
+
+/**
+ * Smooths one IR/RED pair with a linear-phase FIR (DSP_PPG_LP_TAPS), then
+ * splits it into DC (<0.5Hz) and AC (0.5-5Hz) components for SpO2.
+ * ISR-safe; call once per MAX30102 sample at DSP_PPG_FS_HZ.
+ *
+ * @p out may be NULL; when given it receives the smoothed sample.
+ */
+void Dsp_Spo2PushSample(uint32_t ir, uint32_t red, Dsp_PpgSample *out);
 
 /** Non-zero once DSP_PPG_BLOCK samples have accumulated. */
 uint8_t Dsp_Spo2Ready(void);

@@ -42,6 +42,18 @@ void tb_slave_publish(uint8_t flags, uint8_t buttons, uint16_t hr,
                       const char *rfid, uint8_t rfid_len);
 
 /*
+ * Append one smoothed PPG sample, in raw MAX30102 counts, to the waveform ring
+ * the ESP32 reads at TB_REG_PPG_BASE. Call once per sample at TB_PPG_FS_HZ,
+ * from wherever the sample is produced -- two packs and two stores, no HAL, no
+ * critical section, so it is safe from an ISR as well as the superloop.
+ *
+ * Never blocks and never drops on this side: if the ESP32 stops reading, the
+ * ring keeps turning and the ESP32 sees the gap in the sample counter. See the
+ * ring contract in tb_regs.h.
+ */
+void tb_slave_ppg_push(float ir, float red);
+
+/*
  * Pending command from the master, or TB_CMD_NONE. Reading it clears it, so
  * each command is acted on exactly once. Poll from the superloop.
  */

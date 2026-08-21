@@ -47,6 +47,23 @@ static const float32_t mic_env_coeffs[10] = { +0.0001551484f, +0.0003102968f,
 static const float32_t mic_drift_hp_coeffs[5] = { +0.9736948117f, -1.9473896234f,
 		+0.9736948117f, +1.9466975408f, -0.9480817061f };
 
+/* PPG smoothing FIR, 31-tap Hamming lowpass, 10Hz at 100Hz. Windowed sinc,
+ * normalised to unity DC gain (so it cannot shift the perfusion baseline).
+ * Measured response: -0.01dB at 1.2Hz, -0.10dB at 5Hz, -6.05dB at 10Hz,
+ * -40.6dB at 15Hz, below -63dB everywhere above 20Hz. White noise comes out at
+ * 0.42x amplitude. Symmetric, so the delay is a constant 15 samples.
+ * Regenerate with the design script in tools/ppg_fir_selftest.c's header
+ * comment if the corner ever needs to move. */
+static const float32_t ppg_lp_coeffs[DSP_PPG_LP_TAPS] = {
+		+0.0000000000f, +0.0012014264f, +0.0027843278f, +0.0042273161f,
+		+0.0039427634f, +0.0000000000f, -0.0082567773f, -0.0185832101f,
+		-0.0253898204f, -0.0212353087f, +0.0000000000f, +0.0395881126f,
+		+0.0918888770f, +0.1450990810f, +0.1849028786f, +0.1996606673f,
+		+0.1849028786f, +0.1450990810f, +0.0918888770f, +0.0395881126f,
+		+0.0000000000f, -0.0212353087f, -0.0253898204f, -0.0185832101f,
+		-0.0082567773f, +0.0000000000f, +0.0039427634f, +0.0042273161f,
+		+0.0027843278f, +0.0012014264f, +0.0000000000f };
+
 /* PPG DC lowpass, 0.5Hz at 100Hz: the perfusion baseline. */
 static const float32_t ppg_dc_coeffs[5] = { +0.0002413590f, +0.0004827181f,
 		+0.0002413590f, +1.9555782403f, -0.9565436765f };
@@ -84,6 +101,9 @@ static uint16_t resp_hop_count;
 static volatile uint8_t resp_ready;
 
 /* ---- SpO2 state --------------------------------------------------------- */
+static arm_fir_instance_f32 ir_lp_f, red_lp_f;
+/* numTaps + blockSize - 1, with blockSize 1. */
+static float32_t ir_lp_state[DSP_PPG_LP_TAPS], red_lp_state[DSP_PPG_LP_TAPS];
 static arm_biquad_casd_df1_inst_f32 ir_dc_f, red_dc_f, ir_ac_f, red_ac_f;
 static float32_t ir_dc_state[4], red_dc_state[4];
 static float32_t ir_ac_state[8], red_ac_state[8];
@@ -110,6 +130,9 @@ void Dsp_Init(void)
 	memset(red_dc_state, 0, sizeof(red_dc_state));
 	memset(ir_ac_state, 0, sizeof(ir_ac_state));
 	memset(red_ac_state, 0, sizeof(red_ac_state));
+	/* arm_fir_init_f32 zeroes the state buffer itself. */
+	arm_fir_init_f32(&ir_lp_f, DSP_PPG_LP_TAPS, ppg_lp_coeffs, ir_lp_state, 1);
+	arm_fir_init_f32(&red_lp_f, DSP_PPG_LP_TAPS, ppg_lp_coeffs, red_lp_state, 1);
 	arm_biquad_cascade_df1_init_f32(&ir_dc_f, 1, ppg_dc_coeffs, ir_dc_state);
 	arm_biquad_cascade_df1_init_f32(&red_dc_f, 1, ppg_dc_coeffs, red_dc_state);
 	arm_biquad_cascade_df1_init_f32(&ir_ac_f, 2, ppg_ac_coeffs, ir_ac_state);
@@ -552,20 +575,37 @@ float Dsp_RespRateBrpm(Dsp_RespDebug *dbg)
 /*  SpO2                                                                     */
 /* ------------------------------------------------------------------------- */
 
-void Dsp_Spo2PushSample(uint32_t ir, uint32_t red)
+void Dsp_Spo2PushSample(uint32_t ir, uint32_t red, Dsp_PpgSample *out)
 {
+	float32_t ir_f = (float32_t) ir;
+	float32_t red_f = (float32_t) red;
+	float32_t ir_s = 0.0f, red_s = 0.0f;
+
+	/* Smooth first, so every stage below works on a waveform without the
+	 * out-of-band hash: on hardware the raw stream carries ~25 counts of
+	 * sample-to-sample noise on a ~200-count pulse, and noise above 5Hz still
+	 * leaks through the AC bandpass and inflates its RMS, which biases the
+	 * ratio-of-ratios. The FIR runs ahead of the block-full gate below so its
+	 * input never has a gap and the exported waveform stays continuous. */
+	arm_fir_f32(&ir_lp_f, &ir_f, &ir_s, 1);
+	arm_fir_f32(&red_lp_f, &red_f, &red_s, 1);
+
+	float32_t ir_dc = 0.0f, red_dc = 0.0f;
+	arm_biquad_cascade_df1_f32(&ir_dc_f, &ir_s, &ir_dc, 1);
+	arm_biquad_cascade_df1_f32(&red_dc_f, &red_s, &red_dc, 1);
+
+	if (out != NULL) {
+		out->ir = ir_s;
+		out->red = red_s;
+		out->pulse = ir_s - ir_dc;
+	}
+
 	if (ppg_count >= DSP_PPG_BLOCK) {
 		return; /* block full, waiting on Dsp_Spo2Compute */
 	}
 
-	float32_t ir_f = (float32_t) ir;
-	float32_t red_f = (float32_t) red;
-	float32_t ir_dc = 0.0f, red_dc = 0.0f;
-
-	arm_biquad_cascade_df1_f32(&ir_dc_f, &ir_f, &ir_dc, 1);
-	arm_biquad_cascade_df1_f32(&red_dc_f, &red_f, &red_dc, 1);
-	arm_biquad_cascade_df1_f32(&ir_ac_f, &ir_f, &ir_ac_buf[ppg_count], 1);
-	arm_biquad_cascade_df1_f32(&red_ac_f, &red_f, &red_ac_buf[ppg_count], 1);
+	arm_biquad_cascade_df1_f32(&ir_ac_f, &ir_s, &ir_ac_buf[ppg_count], 1);
+	arm_biquad_cascade_df1_f32(&red_ac_f, &red_s, &red_ac_buf[ppg_count], 1);
 
 	ir_dc_acc += ir_dc;
 	red_dc_acc += red_dc;
@@ -627,8 +667,9 @@ void Dsp_Spo2Compute(Dsp_Spo2Result *out)
 	out->red_ac = red_ac;
 	out->perfusion = (ir_dc > 0.0f) ? (ir_ac / ir_dc) : 0.0f;
 
-	/* No finger, or the LED is not reaching the detector. */
-	if (ir_dc < DSP_SPO2_MIN_DC || red_dc < DSP_SPO2_MIN_DC) {
+	/* No finger, or the LED is not reaching the detector. RED is tested first
+	 * because it is the smaller channel and so the one that trips. */
+	if (red_dc < DSP_PPG_MIN_DC || ir_dc < DSP_PPG_MIN_DC) {
 		out->reject = DSP_SPO2_REJ_DC_LOW;
 		return;
 	}
