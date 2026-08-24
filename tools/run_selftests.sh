@@ -62,6 +62,35 @@ echo "==> ppg_fir_selftest"
 $CC $CFLAGS tools/ppg_fir_selftest.c -lm -o "$OUT/ppg_fir_selftest"
 "$OUT/ppg_fir_selftest"
 
+# The pulse-rate detector is the other half of dsp_utils.c that touches no
+# arm_* function, so like ServiceLoRaPoll it is CUT OUT rather than copied and
+# the firmware stays the only copy. Three ranges: MedianF32 and RateIsRegular,
+# which it shares with the ECG path, and everything from PrAt to end of file.
+# The last range assumes the PR section stays LAST in dsp_utils.c - if something
+# is appended after it, the grep below fails and this says so.
+echo "==> ppg_pr_selftest"
+sed -n '/^static float32_t MedianF32/,/^}[[:space:]]*$/p' \
+    Core/Src/dsp_utils.c > "$OUT/pr_body.inc"
+sed -n '/^static uint8_t RateIsRegular/,/^}[[:space:]]*$/p' \
+    Core/Src/dsp_utils.c >> "$OUT/pr_body.inc"
+sed -n '/^static float32_t PrAt/,$p' Core/Src/dsp_utils.c >> "$OUT/pr_body.inc"
+grep -q 'MedianF32' "$OUT/pr_body.inc" \
+    || { echo "cannot find MedianF32() in dsp_utils.c"; exit 1; }
+# RateIsRegular is the shared verdict both rate paths must go through. If the
+# extraction stops finding it, the ECG path has silently lost its agreement
+# test as far as this test is concerned - fail rather than test half of it.
+grep -q 'RateIsRegular(const float32_t' "$OUT/pr_body.inc" \
+    || { echo "cannot find RateIsRegular() in dsp_utils.c"; exit 1; }
+grep -q 'out->bpm = (uint16_t) (bpm + 0.5f);' "$OUT/pr_body.inc" \
+    || { echo "cannot find the end of Dsp_PrCompute() in dsp_utils.c"; exit 1; }
+grep -q 'arm_' "$OUT/pr_body.inc" \
+    && { echo "extracted PR code calls CMSIS; it cannot be host-tested"; exit 1; }
+# shellcheck disable=SC2086
+$CC $CFLAGS -I Core/Inc -I tools/stub -I "$OUT" \
+    tools/ppg_pr_selftest.c -lm \
+    -o "$OUT/ppg_pr_selftest"
+"$OUT/ppg_pr_selftest"
+
 # ServiceLoRaPoll() is the one piece of main.c worth testing on the host: it is
 # pure control flow over a radio, and there is no ARM toolchain here, so without
 # this it would reach hardware never having executed once.

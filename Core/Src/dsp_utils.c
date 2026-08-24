@@ -76,7 +76,10 @@ static const float32_t ppg_ac_coeffs[10] = { +0.9780304792f, -1.9560609584f,
 /* ---- ECG state ---------------------------------------------------------- */
 static arm_biquad_casd_df1_inst_f32 ecg_bp;
 static float32_t ecg_bp_state[8]; /* 4 per stage */
-static float32_t ecg_work[DSP_ECG_WINDOW];
+/* Not static, and named mon_ so CubeMonitor lists it: this is both the working
+ * buffer and the only place the filtered ECG waveform exists. Declared in
+ * dsp_utils.h -- read the contract there before plotting it. */
+float32_t mon_ecg_filtered[DSP_ECG_WINDOW];
 static float32_t ecg_energy[DSP_ECG_WINDOW];
 
 /* ---- Mic / respiratory state -------------------------------------------- */
@@ -112,6 +115,16 @@ static float32_t ir_dc_acc, red_dc_acc;
 static uint16_t ppg_count;
 static uint16_t ppg_warmup; /* counts down from DSP_PPG_WARMUP */
 static volatile uint8_t ppg_ready;
+
+/* ---- Pulse rate state --------------------------------------------------- */
+/* Ring of the normalised pulse (norm_pct), newest at pr_head. Separate from
+ * ir_ac_buf even though both hold a pulse, because they need different lengths
+ * for different reasons: the SpO2 block is 128 samples so the ratio-of-ratios
+ * updates often, and 128 samples is only 1-2 beats - too few for a median of
+ * intervals. Sharing one buffer would force one of the two to be wrong. */
+static float32_t pr_window[DSP_PR_WINDOW];
+static uint16_t pr_head;
+static uint16_t pr_filled; /* saturates at DSP_PR_WINDOW */
 
 void Dsp_Init(void)
 {
@@ -151,6 +164,10 @@ void Dsp_Init(void)
 	ppg_warmup = DSP_PPG_WARMUP;
 	ppg_ready = 0;
 
+	memset(pr_window, 0, sizeof(pr_window));
+	pr_head = 0;
+	pr_filled = 0;
+
 	/* Periodic Hann window, w[n] = 0.5 - 0.5*cos(2*pi*n/N). arm_cos_f32 takes
 	 * radians (it scales by 1/2pi internally). */
 	for (uint32_t n = 0; n < DSP_RESP_FFT_LEN; ++n) {
@@ -181,6 +198,46 @@ static float32_t MedianF32(float32_t *v, uint32_t n)
 	return (n & 1U) ? v[n / 2U] : 0.5f * (v[n / 2U - 1U] + v[n / 2U]);
 }
 
+/**
+ * Shared verdict for both rate detectors: a median is only a rate if the
+ * intervals it came from agree with it.
+ *
+ * One rule in one place on purpose. The ECG and PR paths drifted apart once
+ * already -- PR demanded three agreeing intervals while the ECG published a
+ * rate from a single interval with no agreement test at all, and on a lead-off
+ * AD8232 that turned two dangling-cable transients 2s apart into a confident
+ * "30 bpm" on the triage screen. Whatever this rule should be, both paths have
+ * to be wrong together or right together.
+ *
+ * @p min_agree is the only difference left between the callers, because their
+ * windows hold different numbers of beats. @p agree_out may be NULL.
+ * @return 1 when at least @p min_agree intervals are within
+ *         DSP_PR_SPREAD_FRAC of @p median AND they are a strict majority.
+ */
+static uint8_t RateIsRegular(const float32_t *iv, uint32_t n, float32_t median,
+		uint32_t min_agree, uint32_t *agree_out)
+{
+	uint32_t agree = 0;
+
+	if (median > 0.0f) {
+		for (uint32_t i = 0; i < n; ++i) {
+			float32_t d = iv[i] - median;
+			if (d < 0.0f) {
+				d = -d;
+			}
+			if (d <= (DSP_PR_SPREAD_FRAC * median)) {
+				++agree;
+			}
+		}
+	}
+	if (agree_out != NULL) {
+		*agree_out = agree;
+	}
+	/* Majority as well as a floor: min_agree alone would let 3 agreeing
+	 * intervals carry a window that also held 9 dissenting ones. */
+	return (agree >= min_agree && (agree * 2U) > n) ? 1U : 0U;
+}
+
 void Dsp_EcgProcessWindow(const uint16_t *raw, uint32_t len, Dsp_EcgResult *out)
 {
 	if (out == NULL) {
@@ -199,22 +256,22 @@ void Dsp_EcgProcessWindow(const uint16_t *raw, uint32_t len, Dsp_EcgResult *out)
 	}
 
 	for (uint32_t i = 0; i < len; ++i) {
-		ecg_work[i] = (float32_t) raw[i];
+		mon_ecg_filtered[i] = (float32_t) raw[i];
 	}
 
 	float32_t mean_raw = 0.0f;
-	arm_mean_f32(ecg_work, len, &mean_raw);
+	arm_mean_f32(mon_ecg_filtered, len, &mean_raw);
 	out->mean_raw = (uint16_t) mean_raw;
 
 	/* Centre the block before filtering. Without this the highpass sees the
 	 * ~2048 ADC offset as a step and its transient dwarfs every QRS complex. */
-	arm_offset_f32(ecg_work, -mean_raw, ecg_work, len);
+	arm_offset_f32(mon_ecg_filtered, -mean_raw, mon_ecg_filtered, len);
 
 	/* Bandpass in place, then square to get an energy envelope in which the
 	 * QRS complex dominates far more sharply than in the raw signal. */
-	arm_biquad_cascade_df1_f32(&ecg_bp, ecg_work, ecg_work, len);
-	arm_rms_f32(ecg_work, len, &out->rms_filtered);
-	arm_mult_f32(ecg_work, ecg_work, ecg_energy, len);
+	arm_biquad_cascade_df1_f32(&ecg_bp, mon_ecg_filtered, mon_ecg_filtered, len);
+	arm_rms_f32(mon_ecg_filtered, len, &out->rms_filtered);
+	arm_mult_f32(mon_ecg_filtered, mon_ecg_filtered, ecg_energy, len);
 
 	/* Absolute amplitude gate. The peak-to-mean ratio test below is scale
 	 * invariant, so pure noise can pass it whenever a random sample happens
@@ -267,7 +324,7 @@ void Dsp_EcgProcessWindow(const uint16_t *raw, uint32_t len, Dsp_EcgResult *out)
 	}
 
 	out->beats = (uint8_t) ((beats > 255U) ? 255U : beats);
-	if (interval_count == 0U) {
+	if (interval_count < DSP_ECG_MIN_INTERVALS) {
 		return;
 	}
 
@@ -280,6 +337,15 @@ void Dsp_EcgProcessWindow(const uint16_t *raw, uint32_t len, Dsp_EcgResult *out)
 
 	float32_t bpm = (60.0f * (float32_t) DSP_ADC_FS_HZ) / median_samples;
 	if (bpm < DSP_HR_MIN_BPM || bpm > DSP_HR_MAX_BPM) {
+		return;
+	}
+	/* Same agreement test the PR path applies, and for the same reason: a
+	 * plausible number from intervals that do not agree with each other is not
+	 * a measurement. On a lead-off AD8232 this is the gate that matters --
+	 * two cable transients seconds apart clear the energy test and produce an
+	 * interval in range, and without this they are published as bradycardia. */
+	if (!RateIsRegular(intervals, interval_count, median_samples,
+			DSP_ECG_MIN_INTERVALS, NULL)) {
 		return;
 	}
 	out->bpm = (uint16_t) (bpm + 0.5f);
@@ -594,10 +660,34 @@ void Dsp_Spo2PushSample(uint32_t ir, uint32_t red, Dsp_PpgSample *out)
 	arm_biquad_cascade_df1_f32(&ir_dc_f, &ir_s, &ir_dc, 1);
 	arm_biquad_cascade_df1_f32(&red_dc_f, &red_s, &red_dc, 1);
 
+	/* Normalised by the SAME baseline the pulse was taken from, not by a
+	 * separately smoothed one, so the ratio is exact at every sample rather
+	 * than beating between two filters with different settling. Gated on
+	 * the shared contact floor: below it the "baseline" is ambient light,
+	 * and pulse/tiny_baseline is a large fabricated percentage. */
+	float32_t pulse = ir_s - ir_dc;
+	float32_t norm_pct = (ir_dc >= DSP_PPG_MIN_DC)
+			? (100.0f * pulse / ir_dc) : 0.0f;
+
 	if (out != NULL) {
 		out->ir = ir_s;
 		out->red = red_s;
-		out->pulse = ir_s - ir_dc;
+		out->pulse = pulse;
+		out->norm_pct = norm_pct;
+	}
+
+	/* Feed the rate ring here, ahead of the block-full return below, so its
+	 * timebase has no gaps: Dsp_PrCompute converts sample counts to bpm, so a
+	 * dropped sample does not merely lose data, it shortens an interval and
+	 * biases the rate upward. Warm-up samples are excluded because the settling
+	 * 0.5Hz baseline makes `pulse` a large slow ramp that would read as one
+	 * enormous beat. */
+	if (ppg_warmup == 0U) {
+		pr_window[pr_head] = norm_pct;
+		pr_head = (uint16_t) ((pr_head + 1U) % DSP_PR_WINDOW);
+		if (pr_filled < DSP_PR_WINDOW) {
+			++pr_filled;
+		}
 	}
 
 	if (ppg_count >= DSP_PPG_BLOCK) {
@@ -701,4 +791,143 @@ void Dsp_Spo2Compute(Dsp_Spo2Result *out)
 	out->spo2_pct = spo2;
 	out->valid = 1;
 	out->reject = DSP_SPO2_OK;
+}
+
+/* ------------------------------------------------------------------------- */
+/*  Pulse rate from the PPG                                                  */
+/* ------------------------------------------------------------------------- */
+
+/** Oldest-first access to the ring. Once full, pr_head is the oldest sample. */
+static float32_t PrAt(uint16_t i)
+{
+	uint16_t idx = (uint16_t) ((pr_head + i) % DSP_PR_WINDOW);
+	return pr_window[idx];
+}
+
+void Dsp_PrCompute(Dsp_PrResult *out)
+{
+	if (out == NULL) {
+		return;
+	}
+	memset(out, 0, sizeof(*out));
+
+	/* Partial window only ever gives a worse estimate of the same number, and a
+	 * rate that appears 2s after boot and then changes is harder to trust than
+	 * one that appears late. */
+	if (pr_filled < DSP_PR_WINDOW) {
+		return;
+	}
+
+	/* Amplitude reference: the MEDIAN of four per-quarter maxima, NOT the maximum
+	 * of the whole window. The difference is what makes this work on a sensor
+	 * that is not mounted. One knock produces a spike of 10% or more where a
+	 * pulse is 1%, and with a window maximum the threshold becomes 0.6 of the
+	 * ARTEFACT: every real beat then falls below it, no intervals are found, and
+	 * the whole 4s is thrown away because of one bad sample. Taking a median over
+	 * quarters discards that outlier -- an artefact inflates one quarter's
+	 * maximum and the median ignores it.
+	 *
+	 * Four quarters is the most that still guarantees a beat in each: a quarter
+	 * is 1s, so at DSP_HR_MIN_BPM a quarter can be empty, and an empty quarter
+	 * only ever lowers the reference, which costs sensitivity and not
+	 * correctness -- the refractory and the agreement test below still have to
+	 * pass. If DSP_PR_WINDOW stops being a multiple of 4 the remainder is simply
+	 * not scanned for the reference, which is harmless. */
+	const uint16_t qlen = (uint16_t) (DSP_PR_WINDOW / 4U);
+	float32_t qmax[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	for (uint16_t q = 0; q < 4U; ++q) {
+		for (uint16_t i = 0; i < qlen; ++i) {
+			float32_t v = PrAt((uint16_t) ((q * qlen) + i));
+			if (v > qmax[q]) {
+				qmax[q] = v;
+			}
+		}
+	}
+	float32_t ref = MedianF32(qmax, 4U);
+	if (ref <= 0.0f) {
+		return; /* flat, or gated to zero by the contact floor */
+	}
+
+	const float32_t threshold = DSP_PR_THRESH_FRAC * ref;
+	/* 200ms, as in the ECG path: caps detection at 300bpm, above the 220 the
+	 * plausibility gate allows, so an interval that survives this and still
+	 * fails DSP_HR_MAX_BPM is a real measurement of an implausible rate rather
+	 * than a double-count. */
+	const uint16_t refractory = (uint16_t) ((DSP_PPG_FS_HZ * 200U) / 1000U);
+	const uint32_t max_intervals = 16U;
+	float32_t intervals[16];
+	uint32_t interval_count = 0;
+	uint32_t pulses = 0;
+	int32_t last_peak = -(int32_t) refractory - 1;
+
+	for (uint16_t i = 1; (uint16_t) (i + 1U) < DSP_PR_WINDOW; ++i) {
+		float32_t v = PrAt(i);
+		if (v > threshold && v >= PrAt((uint16_t) (i - 1U))
+				&& v >= PrAt((uint16_t) (i + 1U))
+				&& ((int32_t) i - last_peak) > (int32_t) refractory) {
+			if (last_peak >= 0 && interval_count < max_intervals) {
+				intervals[interval_count++] = (float32_t) ((int32_t) i - last_peak);
+			}
+			last_peak = (int32_t) i;
+			++pulses;
+		}
+	}
+
+	out->pulses = (uint8_t) ((pulses > 255U) ? 255U : pulses);
+	if (interval_count < DSP_PR_MIN_INTERVALS) {
+		return;
+	}
+
+	float32_t median = MedianF32(intervals, interval_count);
+	if (median <= 0.0f) {
+		return;
+	}
+
+	/* Two separate questions, deliberately not conflated:
+	 *
+	 *   `spread` (reported, diagnostic) is the WIDEST deviation from the median,
+	 *   because one ectopic beat among five regular ones barely moves an RMS
+	 *   spread but is the whole finding. Taken against the median so a single
+	 *   outlier cannot inflate the reference it is compared to.
+	 *
+	 *   `regular` (the gate) is a MAJORITY vote, not that worst case, and lives
+	 *   in RateIsRegular() so the ECG path cannot apply a weaker one. Requiring
+	 *   every interval to agree means one artefact vetoes an otherwise clean 4s
+	 *   window, which on an unmounted sensor is most windows -- and the median it
+	 *   would have vetoed is already correct, since a median over 4-5 intervals
+	 *   is exactly what survives one bad one.
+	 *
+	 * This does not open the door to publishing a rate for atrial fibrillation:
+	 * there no cluster holds a majority within 30%, so `regular` still comes out
+	 * 0. What it stops is throwing away a regular rhythm because the finger was
+	 * bumped once. */
+	float32_t worst = 0.0f;
+	uint32_t agree = 0;
+	for (uint32_t i = 0; i < interval_count; ++i) {
+		float32_t d = intervals[i] - median;
+		if (d < 0.0f) {
+			d = -d;
+		}
+		if (d > worst) {
+			worst = d;
+		}
+	}
+	out->spread = worst / median;
+	out->regular = RateIsRegular(intervals, interval_count, median,
+			DSP_PR_MIN_INTERVALS, &agree);
+	out->agree = (uint8_t) ((agree > 255U) ? 255U : agree);
+
+	float32_t bpm = (60.0f * (float32_t) DSP_PPG_FS_HZ) / median;
+	if (bpm < DSP_HR_MIN_BPM || bpm > DSP_HR_MAX_BPM) {
+		return;
+	}
+	/* Irregular intervals leave bpm at 0 on purpose. The median would still
+	 * produce a plausible-looking number, and a plausible number is exactly
+	 * what must not reach a triage screen when the input was motion artefact.
+	 * out->pulses and out->spread stay populated so the caller can tell this
+	 * apart from no signal at all. */
+	if (!out->regular) {
+		return;
+	}
+	out->bpm = (uint16_t) (bpm + 0.5f);
 }

@@ -56,6 +56,47 @@
  * inside this. */
 #define DSP_PPG_WARMUP 640u
 
+/* ---- Pulse rate from the PPG -------------------------------------------- */
+/* 4s of PPG, matching DSP_ECG_WINDOW's 4s so PR and HR are averages over the
+ * same span and can be compared beat-for-beat when both are alive. At 100Hz
+ * that is 3-5 pulse intervals to take a median over. */
+#define DSP_PR_WINDOW 400u
+/* Two peaks (one interval) is not a rate, it is a coincidence: a single motion
+ * bump plus one real systolic peak produces exactly that. Three intervals is
+ * the minimum that can outvote one bad one through the median. */
+#define DSP_PR_MIN_INTERVALS 3u
+/* The same floor for the ECG window, which is also 4s and so also holds 3-5
+ * intervals. It used to be 1 -- any single interval in the plausible range
+ * became a published bpm -- and on a lead-off AD8232 that is exactly what
+ * happens: the rails saturate, two cable transients seconds apart clear the
+ * 8x peak-to-mean energy test, and their one interval lands in range. The
+ * result was a confident bradycardia on the triage screen from an unplugged
+ * electrode. Three intervals plus the agreement test cost the low end of the
+ * range -- 3 intervals do not fit in 4s below ~45bpm, so DSP_HR_MIN_BPM's 30 is
+ * unreachable from either path -- and that is the right trade, because the cost
+ * is a BLANK. A blank is a visible failure that an operator retries; a
+ * plausible wrong number is not. (Contrast DSP_RR_MAX_BRPM, where the failure
+ * was halving a high rate into a reassuring normal one.) */
+#define DSP_ECG_MIN_INTERVALS 3u
+/* Intervals within this fraction of the median count as agreeing. Motion
+ * artefact scatters them far wider; a resting pulse holds inside a few percent,
+ * and even marked sinus arrhythmia stays inside 30%.
+ *
+ * This gate has a deliberate cost: a genuinely irregular rhythm (AF, frequent
+ * ectopics) also fails it, so PR reports 0 rather than a number. That is the
+ * right trade for a PPG, which cannot tell an ectopic beat from a knock on the
+ * sensor - both are one out-of-place pulse. Dsp_PrResult.regular carries the
+ * distinction outward so the caller can say "irregular" instead of "no
+ * reading". Diagnosing the rhythm itself needs the ECG; see Dsp_EcgResult. */
+#define DSP_PR_SPREAD_FRAC 0.30f
+/* Fraction of the systolic peak used as the detection threshold. The dicrotic
+ * notch is the thing being excluded: it follows the systolic peak by 200-400ms
+ * (inside a plausible interval, so the refractory alone will not reject it) and
+ * reaches 20-50% of its height. 0.6 clears it with margin. Compare the ECG
+ * path's 0.35 of a SQUARED envelope, which is 0.59 in amplitude terms - the
+ * same place, reached differently. */
+#define DSP_PR_THRESH_FRAC 0.6f
+
 /* ---- Plausibility limits ------------------------------------------------ */
 #define DSP_HR_MIN_BPM 30.0f
 #define DSP_HR_MAX_BPM 220.0f
@@ -122,10 +163,15 @@
 #define DSP_SPO2_CAL_POINTS 4u
 
 typedef struct Dsp_EcgResult {
-	uint16_t bpm; /**< 0 when no plausible rate was found. */
+	/** 0 when no plausible rate was found. Requires DSP_ECG_MIN_INTERVALS
+	 *  intervals that agree with their own median (the same test the PR path
+	 *  uses), so a lead-off trace reads 0 rather than the interval between two
+	 *  cable transients. Compare @p beats: beats > 0 with bpm 0 means peaks were
+	 *  found but nothing consistent, which is the lead-off signature. */
+	uint16_t bpm;
 	uint16_t mean_raw; /**< Mean of the unfiltered window, for telemetry. */
 	float rms_filtered; /**< RMS of the 5-15Hz band, a signal-quality hint. */
-	uint8_t beats; /**< R-peaks detected in this window. */
+	uint8_t beats; /**< R-peaks detected in this window, before any gating. */
 } Dsp_EcgResult;
 
 /** Why a block was rejected. Mirrored to mon_spo2_reject for CubeMonitor. */
@@ -162,8 +208,32 @@ void Dsp_Init(void);
 
 /* ---- ECG ---------------------------------------------------------------- */
 /**
+ * The 5-15Hz filtered ECG window, mean removed, in ADC counts. This is the
+ * waveform to plot: the raw mon_ecg_raw stream carries baseline wander and
+ * mains hum that bury the QRS complex.
+ *
+ * READ THE UPDATE PATTERN BEFORE TRUSTING A PLOT. Unlike the PPG monitors,
+ * which are per-sample, this whole array is rewritten in one burst every 4s
+ * when Dsp_EcgProcessWindow() runs -- 2000 samples appear at once, then nothing
+ * changes for 4s. CubeMonitor sampling it as a scalar therefore shows a
+ * staircase, not a trace; plot it as an array, or index one element to watch
+ * that phase of the beat.
+ *
+ * Only the first @p len entries of the last call are meaningful. The tail holds
+ * whatever the previous, longer window left there. main.c always passes the
+ * full ECG_BUFFER_SIZE, so in this firmware all 2000 are live.
+ *
+ * Also the function's working buffer, hence "not ISR-safe" below: it is
+ * overwritten in place with the raw copy, the mean-removed copy, and then the
+ * filter output, so reading it while Dsp_EcgProcessWindow() runs gives a mix of
+ * the three. Harmless for a debug plot, wrong for anything that computes on it.
+ */
+extern float32_t mon_ecg_filtered[DSP_ECG_WINDOW];
+
+/**
  * Bandpasses a raw ECG window to 5-15Hz and measures the heart rate from the
- * median R-R interval. Not ISR-safe (uses a shared working buffer) and not
+ * median R-R interval. Leaves the filtered window in mon_ecg_filtered.
+ * Not ISR-safe (uses a shared working buffer) and not
  * reentrant; call from the main loop only. @p len must be <= DSP_ECG_WINDOW.
  */
 void Dsp_EcgProcessWindow(const uint16_t *raw, uint32_t len,
@@ -228,6 +298,24 @@ typedef struct Dsp_PpgSample {
 	 *  whereas subtracting a slow baseline leaves the FIR's linear phase
 	 *  intact above ~1Hz. */
 	float pulse;
+	/** The same pulse as a percentage of its own baseline (100 * pulse / DC),
+	 *  i.e. the instantaneous perfusion index. This is the only PPG trace here
+	 *  whose AMPLITUDE means anything on its own: dividing by DC cancels LED
+	 *  current, skin tone, sensor distance and contact pressure, so two
+	 *  recordings taken hours apart with the finger held differently are
+	 *  directly comparable, which raw counts are not. A seated finger gives
+	 *  0.5-2% peak to peak.
+	 *
+	 *  0 whenever the IR baseline is below DSP_PPG_MIN_DC. That gate is not
+	 *  about divide-by-zero -- with no finger the baseline is ambient light, and
+	 *  dividing a noise pulse by a small noise baseline manufactures a large,
+	 *  entirely fictional percentage.
+	 *
+	 *  Like @p pulse, it shows the 0.5Hz DC filter settling for the first
+	 *  seconds after Dsp_Init (see DSP_PPG_WARMUP): the baseline is still
+	 *  climbing towards the signal, so the difference between them is far too
+	 *  large. Real on a plot, meaningless as a measurement. */
+	float norm_pct;
 } Dsp_PpgSample;
 
 /**
@@ -247,5 +335,60 @@ uint8_t Dsp_Spo2Ready(void);
  * flag. Not ISR-safe; call from the main loop.
  */
 void Dsp_Spo2Compute(Dsp_Spo2Result *out);
+
+/* ---- Pulse rate from the PPG -------------------------------------------- */
+/**
+ * A rate counted from the PPG instead of the ECG. NOT a heart rate, and the
+ * difference is not pedantry: this counts mechanical pulses arriving at the
+ * fingertip, whereas HR counts electrical depolarisations at the chest. A beat
+ * too weak to open the aortic valve — an early ectopic, or any beat during a
+ * pulse deficit — is invisible here and present in the ECG. So PR <= HR always,
+ * and where they diverge the difference is itself the finding.
+ *
+ * Use it as a stand-in for HR when the ECG is unusable, which for triage
+ * rate-counting it is: on a perfusing patient the two agree within a beat or
+ * two. Do not use it to judge rhythm.
+ */
+typedef struct Dsp_PrResult {
+	uint16_t bpm; /**< 0 when no plausible rate was found. */
+	uint8_t pulses; /**< Peaks detected in the window, before any gating. */
+	/** 1 when a MAJORITY of intervals agreed with the median to within
+	 *  DSP_PR_SPREAD_FRAC, and at least DSP_PR_MIN_INTERVALS of them did. 0 with
+	 *  a non-zero @p pulses count means peaks were found but no consistent
+	 *  spacing dominated: either motion artefact or a genuinely irregular
+	 *  rhythm, and a PPG cannot distinguish those. Surface it as "irregular",
+	 *  never as a diagnosis, and never as a rate.
+	 *
+	 *  A majority rather than unanimity on purpose: an unmounted sensor gets
+	 *  bumped, and one bad interval among five should not discard a window whose
+	 *  median is already correct. Compare @p spread, which does report that
+	 *  worst case. */
+	uint8_t regular;
+	/** Interval scatter actually measured, as a fraction of the median, taken
+	 *  from the WORST interval. Its value when @p regular is 0 says which
+	 *  failure it was: 0.3-0.5 is a plausible arrhythmia, several hundred
+	 *  percent is the sensor being knocked. Note a large @p spread alongside
+	 *  @p regular 1 is the normal, healthy outcome of one artefact in an
+	 *  otherwise clean window. 0 when fewer than DSP_PR_MIN_INTERVALS intervals
+	 *  were found. */
+	float spread;
+	/** How many intervals landed within DSP_PR_SPREAD_FRAC of the median. Read
+	 *  it against @p pulses: agree == pulses-1 is a clean window, and anything
+	 *  less is the count of artefacts the median absorbed. */
+	uint8_t agree;
+} Dsp_PrResult;
+
+/**
+ * Counts the pulse rate from the last DSP_PR_WINDOW samples of the normalised
+ * PPG. Reads a ring that Dsp_Spo2PushSample fills, so it needs no buffer from
+ * the caller and can be called at any cadence; call it no faster than once per
+ * DSP_PR_WINDOW/4 samples or consecutive results will share most of their
+ * peaks. Not ISR-safe; call from the main loop.
+ *
+ * Works on norm_pct, not raw counts, so the threshold is a fixed fraction of a
+ * quantity already independent of LED current, distance and skin tone. Returns
+ * bpm 0 (and leaves @p out zeroed) until the ring has filled.
+ */
+void Dsp_PrCompute(Dsp_PrResult *out);
 
 #endif /* DSP_UTILS_H */

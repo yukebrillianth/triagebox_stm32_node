@@ -1,0 +1,457 @@
+diff --git a/Core/Inc/tb_slave.h b/Core/Inc/tb_slave.h
+index 7111179..05bed71 100644
+--- a/Core/Inc/tb_slave.h
++++ b/Core/Inc/tb_slave.h
+@@ -29,6 +29,19 @@
+  */
+ void tb_slave_init(void);
+ 
++/*
++ * Superloop tick. Re-inits I2C2 if the slave has been wedged (BUSY latched, or
++ * no longer listening) for a second or more.
++ *
++ * This is not optional politeness: I2C2's pins are the ESP32's *only* I2C bus,
++ * shared with the GT911 touch controller, the TCA9554 display expander and the
++ * SW6106 PMIC. A slave that holds SCL low takes all three with it, and the
++ * ESP32 shows it as a white screen with no UI at all -- bsp_display_start()
++ * fails on the GT911 probe before the first LVGL screen is ever loaded.
++ * Nothing on the ESP32 side can clear that; only this can.
++ */
++void tb_slave_service(void);
++
+ /*
+  * Publish a consistent snapshot for the master to read. Call from the superloop
+  * with the latest values; cheap (a struct fill plus a memcpy of ~48 bytes).
+@@ -70,5 +83,12 @@ bool tb_slave_take_result(uint8_t *priority, uint8_t *confidence);
+ extern volatile uint32_t mon_i2c_reads;   /**< completed master reads */
+ extern volatile uint32_t mon_i2c_writes;  /**< completed master writes */
+ extern volatile uint32_t mon_i2c_errors;  /**< bus errors, incl. recovered AF */
++extern volatile uint32_t mon_i2c_recoveries; /**< wedged-bus re-inits; >0 means
++                                                  the bus jammed at least once */
++extern volatile uint32_t mon_i2c_rearm_forced; /**< re-arms the HAL refused and
++                                                    rearm_listen() had to force.
++                                                    Climbing = aborted transfers
++                                                    that would silently have left
++                                                    the slave deaf. */
+ 
+ #endif /* TB_SLAVE_H */
+diff --git a/Core/Src/tb_slave.c b/Core/Src/tb_slave.c
+index a01f603..f4f5ef7 100644
+--- a/Core/Src/tb_slave.c
++++ b/Core/Src/tb_slave.c
+@@ -18,6 +18,72 @@
+ volatile uint32_t mon_i2c_reads = 0;
+ volatile uint32_t mon_i2c_writes = 0;
+ volatile uint32_t mon_i2c_errors = 0;
++volatile uint32_t mon_i2c_recoveries = 0;
++volatile uint32_t mon_i2c_rearm_forced = 0;
++
++/* How long the slave may look wedged before tb_slave_service() re-inits it.
++ * Longer than the ESP32's 50 ms poll and than any single transaction (the
++ * 132-byte PPG read is ~13 ms at 100 kHz), short enough that a jam clears
++ * before the ESP32 finishes booting and gives up on the bus. */
++#define TB_SLAVE_STUCK_MS 1000U
++
++/* Last tick at which the slave was armed and listening. */
++static uint32_t s_healthy_ms = 0;
++
++/*
++ * Set when re-arming the slave failed even after the forced path in
++ * rearm_listen(), cleared by bus_reinit(). This is the only evidence
++ * tb_slave_service() can act on for the family of faults where the slave is left
++ * not listening while State still reads LISTEN.
++ *
++ * HAL_I2C_EnableListen_IT() only accepts HAL_I2C_STATE_READY and returns
++ * HAL_BUSY from anything else -- and I2C_ITError() deliberately KEEPS
++ * State = LISTEN whenever the LISTEN bit is set. So on every error path that
++ * routes through I2C_ITError() (STOPF with bytes still outstanding, and anything
++ * with a bus or overrun error), a bare re-arm is refused. Both call sites used to
++ * throw the result away with (void), so the refusal was invisible.
++ *
++ * A refused re-arm is not cosmetic: I2C_Slave_STOPF() has already done
++ * __HAL_I2C_DISABLE_IT(EVT|BUF|ERR) and I2C_Slave_AF() may have cleared
++ * I2C_CR1_ACK, while PE stays set. An enabled slave with no interrupts sets ADDR
++ * in hardware on the next address match with nothing to clear it -- SCL low
++ * forever, taking the ESP32's touch/expander/PMIC bus down with it. State reads
++ * LISTEN throughout, so the state test in tb_slave_service() calls it healthy.
++ */
++static volatile bool s_rearm_failed = false;
++
++/*
++ * Re-arm listening, and if the HAL refuses, take the state back by force.
++ *
++ * The plain HAL_I2C_EnableListen_IT() only accepts HAL_I2C_STATE_READY. On the
++ * refused path the state is LISTEN, and HAL_I2C_DisableListen_IT() accepts
++ * exactly that and yields READY -- so the documented way out is the
++ * Disable/Enable pair, not Enable alone.
++ *
++ * The PE toggle in between is not cosmetic. An aborted slave transmit leaves a
++ * byte sitting in DR with TXE reset, and I2C_Slave_AF() only calls
++ * I2C_Flush_DR() on the branch it does not take here. Left there, that byte is
++ * shifted out as the FIRST byte of the next read, which the master then decodes
++ * as proto_ver. Clearing PE resets the peripheral's state machine and empties DR
++ * without touching OAR1/CCR/CR2, and EnableListen sets PE again on its way past.
++ *
++ * s_rearm_failed is only set if even that fails, which leaves the superloop to
++ * do a full bus_reinit().
++ */
++static void rearm_listen(I2C_HandleTypeDef *hi2c)
++{
++    if (HAL_I2C_EnableListen_IT(hi2c) == HAL_OK) {
++        return;
++    }
++    if (HAL_I2C_DisableListen_IT(hi2c) == HAL_OK) {
++        __HAL_I2C_DISABLE(hi2c);
++        if (HAL_I2C_EnableListen_IT(hi2c) == HAL_OK) {
++            ++mon_i2c_rearm_forced;
++            return;
++        }
++    }
++    s_rearm_failed = true;
++}
+ 
+ /*
+  * Double buffer. The superloop fills s_stage; the ISR only ever touches
+@@ -31,21 +97,71 @@ volatile uint32_t mon_i2c_errors = 0;
+ static tb_snapshot_t s_stage;
+ static volatile tb_snapshot_t s_live;
+ 
+-/* Latched at the start of each master read so a multi-byte read is coherent
+- * even if the superloop publishes mid-transaction. */
+-static uint8_t s_tx[sizeof(tb_snapshot_t)];
++/*
++ * ONE staging buffer spanning the whole register-pointer space, prefilled 0xFF.
++ * It latches the addressed block at ADDR time so a multi-byte read stays
++ * coherent if the superloop publishes mid-transaction. Only the ADDRESSED block
++ * is copied in, so a vitals poll does not pay for the 132-byte waveform.
++ *
++ * It is 256 bytes rather than 48 so that the arm can index it by register
++ * address, which lets the out-of-range case arm a real run of pad bytes ending
++ * at 0x100 -- unreachable with a one-byte pointer, so that case cannot be
++ * over-read at all.
++ *
++ * WHY EVERY ARM IS THE ADDRESSED BLOCK'S EXACT LENGTH, and never more.
++ * Over-arming looks like the safe answer to an over-reading master and is a trap
++ * in this HAL. Arm N, let the master take M < N, and at the closing NACK the
++ * state is BUSY_TX_LISTEN with XferCount != 0, so:
++ *   - I2C_Slave_AF() takes its else branch: clears AF, no I2C_Flush_DR(), leaves
++ *     the interrupts on.
++ *   - I2C_Slave_STOPF() then disables EVT|BUF|ERR, sees XferCount != 0, flags
++ *     HAL_I2C_ERROR_AF and calls I2C_ITError().
++ *   - I2C_ITError() sees the LISTEN bit set and KEEPS State = LISTEN.
++ *   - HAL_I2C_ErrorCallback()'s re-arm below then does nothing at all:
++ *     HAL_I2C_EnableListen_IT() only accepts HAL_I2C_STATE_READY and returns
++ *     HAL_BUSY from LISTEN.
++ * The slave ends every read with its interrupts off, ACK cleared, a stale byte
++ * still in DR, and State reading LISTEN. PE is still set, so the next address
++ * match sets ADDR in hardware with no ISR to clear it -- SCL low forever, on the
++ * bus that also carries the ESP32's touch controller, IO expander and PMIC
++ * (white panel, dead power button, `I2C hardware timeout detected`). And because
++ * the state reads LISTEN, tb_slave_service() calls that healthy and never
++ * recovers it. Arming to the end of the pointer space made the wedge reachable
++ * on EVERY read instead of preventing it.
++ *
++ * At the exact length the HAL takes its clean path instead: XferCount reaches 0,
++ * I2C_SlaveTransmit_TXE() sets State = LISTEN itself, I2C_Slave_AF() takes its
++ * first branch (flushes DR, calls ListenCplt), and the re-arm below runs from
++ * READY and works. That is the path this link has always run on.
++ *
++ * The cost is that a master reading PAST the end of an in-range block still
++ * wedges us, by the same chain. Not fixable from this side -- see the arm site.
++ */
++#define TB_TX_SPAN 0x100U
++static uint8_t s_tx[TB_TX_SPAN];
++
++/* The new arm indexes s_tx by register address, so the layout in tb_regs.h and
++ * the structs it describes have to agree exactly. They are only checkable here,
++ * where both are visible. */
++_Static_assert(sizeof(tb_snapshot_t) == TB_REG_READ_END,
++               "tb_snapshot_t does not match the read block offsets");
++_Static_assert(TB_REG_PPG_BASE + sizeof(tb_ppg_block_t) == TB_REG_PPG_END,
++               "tb_ppg_block_t does not match TB_REG_PPG_END");
++_Static_assert(TB_REG_PPG_END <= TB_TX_SPAN,
++               "PPG block runs off the end of the one-byte pointer space");
++_Static_assert(TB_REG_READ_END <= TB_REG_CMD,
++               "read block overlaps the write block");
+ 
+ /*
+- * PPG waveform ring, written by tb_slave_ppg_push() and latched into s_ppg_tx
+- * the same way s_live is. It needs the latch for the same reason: a 132-byte
+- * read takes ~12ms at 100kHz, which is long enough for a new sample to land on
+- * the slot the master is part-way through reading.
++ * PPG waveform ring, written by tb_slave_ppg_push() and latched into s_tx at
++ * TB_REG_PPG_BASE the same way s_live is. It needs the latch for the same
++ * reason: a 132-byte read takes ~12ms at 100kHz, which is long enough for a new
++ * sample to land on the slot the master is part-way through reading.
+  *
+  * volatile is doing real work here, not decoration -- see the store order in
+  * tb_slave_ppg_push().
+  */
+ static volatile tb_ppg_block_t s_ppg;
+-static uint8_t s_ppg_tx[sizeof(tb_ppg_block_t)];
+ 
+ static volatile uint8_t s_ptr;         /* register pointer, auto-increments */
+ static volatile bool s_ptr_valid;      /* false until the master writes one */
+@@ -66,23 +182,20 @@ static void arm_receive(void)
+                                       I2C_NEXT_FRAME);
+ }
+ 
+-void tb_slave_init(void)
++/*
++ * Bring the peripheral up and arm listening. Split out of tb_slave_init() so
++ * the watchdog in tb_slave_service() can re-run just this part without wiping
++ * the published snapshot.
++ *
++ * On failure the peripheral is DISABLED rather than left enabled, and we do not
++ * call Error_Handler(). An enabled I2C slave whose interrupts never run holds
++ * SCL low on the first address match and never lets go -- and this bus is also
++ * the ESP32's touch controller, display expander and PMIC, so one dead STM32
++ * takes the whole panel down with it (white screen, no UI, dead power button).
++ * A dead link is bad; a dead panel is worse.
++ */
++static void bus_reinit(void)
+ {
+-    memset(&s_stage, 0, sizeof(s_stage));
+-    s_stage.proto_ver = TB_PROTO_VER;
+-    s_stage.battery = 0xFFU; /* not measured */
+-
+-    memcpy((void *)&s_live, &s_stage, sizeof(s_stage));
+-    memcpy(s_tx, &s_stage, sizeof(s_stage));
+-
+-    memset((void *)&s_ppg, 0, sizeof(s_ppg));
+-    memset(s_ppg_tx, 0, sizeof(s_ppg_tx));
+-
+-    s_ptr = 0U;
+-    s_ptr_valid = false;
+-
+-    /* CubeMX leaves OwnAddress1 at 0, so set it and re-init. HAL_I2C_Init
+-     * writes OAR1 from Init, so this is the whole change needed. */
+     HAL_I2C_DeInit(&hi2c2);
+     hi2c2.Init.OwnAddress1 = TB_I2C_SLAVE_ADDR_HAL;
+     hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+@@ -93,8 +206,14 @@ void tb_slave_init(void)
+      * corrupt data instead of a brief delay.
+      */
+     hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
++
++    s_ptr = 0U;
++    s_ptr_valid = false;
++    s_rearm_failed = false; /* fresh peripheral; any past refusal is moot */
++
+     if (HAL_I2C_Init(&hi2c2) != HAL_OK) {
+-        Error_Handler();
++        __HAL_I2C_DISABLE(&hi2c2);
++        return;
+     }
+ 
+     /*
+@@ -108,12 +227,135 @@ void tb_slave_init(void)
+      * by it by a few microseconds. That is exactly why the transmit buffer is
+      * pre-staged: the delay costs a little clock stretching, never wrong data.
+      */
+-
+     if (HAL_I2C_EnableListen_IT(&hi2c2) != HAL_OK) {
+-        Error_Handler();
++        __HAL_I2C_DISABLE(&hi2c2);
+     }
+ }
+ 
++void tb_slave_init(void)
++{
++    memset(&s_stage, 0, sizeof(s_stage));
++    s_stage.proto_ver = TB_PROTO_VER;
++    s_stage.battery = 0xFFU; /* not measured */
++
++    /* 0xFF everywhere first, so every gap in the map -- the write block, the
++     * hole between 0x43 and 0x50, everything past the waveform -- reads back as
++     * "nothing here" instead of whatever was in RAM. The two memcpys below only
++     * ever overwrite the parts that mean something. */
++    memset(s_tx, 0xFF, sizeof(s_tx));
++
++    memcpy((void *)&s_live, &s_stage, sizeof(s_stage));
++    memcpy(s_tx, &s_stage, sizeof(s_stage));
++
++    memset((void *)&s_ppg, 0, sizeof(s_ppg));
++    memset(&s_tx[TB_REG_PPG_BASE], 0, sizeof(tb_ppg_block_t));
++
++    s_ptr = 0U;
++    s_ptr_valid = false;
++    s_healthy_ms = HAL_GetTick();
++
++    /* CubeMX leaves OwnAddress1 at 0, so set it and re-init -- see bus_reinit(),
++     * which the watchdog below also uses. */
++    bus_reinit();
++}
++
++/*
++ * Is the peripheral DEAF: enabled, so it will ACK its address and then stretch
++ * SCL, but with the interrupts that would service the match switched off?
++ *
++ * This is a register test, not a HAL-state test, and that is the entire point.
++ * Every wedge in this file's history has had the same shape -- some HAL path
++ * disabled EVT|ERR and left PE set -- and every attempt to catch it by asking
++ * hi2c2.State has failed, because the paths that do it also leave State reading
++ * LISTEN (I2C_ITError keeps LISTEN; I2C_SlaveTransmit_TXE sets it early). CR1 and
++ * CR2 cannot lie: if PE is set and ITEVTEN is clear, the next address match sets
++ * ADDR in hardware with nothing to clear it, and SCL goes to the floor and stays
++ * there -- along with the ESP32's touch controller, IO expander and PMIC.
++ *
++ * Read once, no side effects, safe to call from the superloop at any time.
++ */
++static bool slave_is_deaf(void)
++{
++    uint32_t cr1 = hi2c2.Instance->CR1;
++    uint32_t cr2 = hi2c2.Instance->CR2;
++
++    return ((cr1 & I2C_CR1_PE) != 0U) &&
++           ((cr2 & (I2C_CR2_ITEVTEN | I2C_CR2_ITERREN)) !=
++            (I2C_CR2_ITEVTEN | I2C_CR2_ITERREN));
++}
++
++/*
++ * Watchdog for a wedged slave. Call from the superloop.
++ *
++ * Healthy means one exact thing: HAL state LISTEN -- armed, between
++ * transactions. Every other state is legal only in passing, so anything that
++ * persists for TB_SLAVE_STUCK_MS is a wedge:
++ *
++ *  - Stuck mid-transfer (BUSY_TX_LISTEN / BUSY_RX_LISTEN), holding SCL low and so
++ *    taking the ESP32's touch/expander/PMIC bus down with it.
++ *  - Listening lost (READY). If EnableListen_IT fails to re-arm on an error path,
++ *    the slave goes quiet for good.
++ *  - Re-arm REFUSED (s_rearm_failed), which State cannot show. Every error path
++ *    through I2C_ITError() keeps State = LISTEN while EnableListen_IT only accepts
++ *    READY, so the slave can be left with EVT|BUF|ERR disabled and ACK cleared
++ *    while looking perfectly armed. That combination stretches SCL forever on the
++ *    next address match. See s_rearm_failed.
++ *
++ * WHAT THIS STILL CANNOT SEE, so do not read mon_i2c_recoveries == 0 as "the bus
++ * is fine": a transmit under-run where the master keeps clocking past the armed
++ * length. I2C_SlaveTransmit_TXE() sets State back to LISTEN as soon as the last
++ * armed byte reaches DR, so this function refreshes s_healthy_ms every pass while
++ * SCL is on the floor, and no error path has run yet to set s_rearm_failed. There
++ * is no state to test for. The mitigation is upstream, at the arm site: arm each
++ * block's exact length so the ordinary read is on the HAL's clean path, and keep
++ * the ESP32's read length equal to the block length.
++ *
++ * SR2's BUSY flag is deliberately NOT part of the test. It tracks the bus, not
++ * us -- it sets on any START, including the ESP32 talking to the touch
++ * controller -- and it does not gate slave operation, only master mode. Testing
++ * it would risk re-initialising a perfectly healthy slave because of someone
++ * else's traffic.
++ *
++ * The threshold is safe against false positives: the longest legitimate
++ * transaction is the 132-byte PPG read at ~13 ms, and the superloop runs every
++ * ~10 ms, so it sees idle LISTEN many times between the ESP32's 50 ms polls.
++ *
++ * Recovery is DeInit/Init/EnableListen, which releases SDA and SCL because
++ * MspDeInit puts the pins back to analog. Published data survives untouched.
++ *
++ * ponytail: ceiling is that this only fixes the case where WE hold the bus. If
++ * the ESP32 side is the one stuck low, the STM32 cannot clear it -- that needs
++ * the nine-clock master recovery pulse on PB10, which means temporarily driving
++ * SCL as GPIO. Add it if mon_i2c_recoveries climbs but the panel stays white.
++ */
++void tb_slave_service(void)
++{
++    uint32_t now = HAL_GetTick();
++
++    /* Checked before the state test, because this is the case State lies about:
++     * it reads LISTEN while the interrupts are off. Recover at once -- waiting
++     * TB_SLAVE_STUCK_MS would just be a second of held bus. */
++    if (s_rearm_failed) {
++        ++mon_i2c_recoveries;
++        bus_reinit();
++        s_healthy_ms = now;
++        return;
++    }
++
++    if (HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_LISTEN) {
++        s_healthy_ms = now;
++        return;
++    }
++
++    if ((now - s_healthy_ms) < TB_SLAVE_STUCK_MS) {
++        return; /* mid-transaction; let it finish normally */
++    }
++
++    ++mon_i2c_recoveries;
++    bus_reinit();
++    s_healthy_ms = now;
++}
++
+ void tb_slave_publish(uint8_t flags, uint8_t buttons, uint16_t hr,
+                       uint16_t spo2, uint16_t rr_x10, uint16_t bp_sys,
+                       uint16_t bp_dia, uint8_t battery, uint8_t sensor_ok,
+@@ -196,32 +438,35 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection,
+         arm_receive();
+     } else {
+         uint8_t start = s_ptr_valid ? s_ptr : 0U;
+-        uint8_t *src;
+         uint16_t len;
+ 
+         /* Latch whichever block was addressed. This is the instant that makes a
+          * multi-byte read coherent, and only the block actually being read is
+          * copied -- the waveform block is 132 bytes and there is no reason to
+          * pay for it on a vitals poll. */
+-        if (start < sizeof(s_tx)) {
+-            memcpy(s_tx, (const void *)&s_live, sizeof(s_tx));
+-            src = &s_tx[start];
+-            len = (uint16_t)(sizeof(s_tx) - start);
++        if (start < TB_REG_READ_END) {
++            memcpy(s_tx, (const void *)&s_live, sizeof(tb_snapshot_t));
++            len = (uint16_t)(TB_REG_READ_END - start);
+         } else if ((start >= TB_REG_PPG_BASE) && (start < TB_REG_PPG_END)) {
+-            memcpy(s_ppg_tx, (const void *)&s_ppg, sizeof(s_ppg_tx));
+-            src = &s_ppg_tx[start - TB_REG_PPG_BASE];
++            memcpy(&s_tx[TB_REG_PPG_BASE], (const void *)&s_ppg,
++                   sizeof(tb_ppg_block_t));
+             len = (uint16_t)(TB_REG_PPG_END - start);
+         } else {
+-            /* Out-of-range pointer, or the write block, which is not readable.
+-             * Feed 0xFF rather than leaking adjacent memory -- 0xFF is also
+-             * what an idle bus looks like, so it reads as "nothing here" on the
+-             * master's console. */
+-            static uint8_t pad = 0xFFU;
+-            (void)HAL_I2C_Slave_Seq_Transmit_IT(hi2c, &pad, 1U, I2C_LAST_FRAME);
+-            return;
++            /* An out-of-range pointer, or the write block: the addressed "block"
++             * is the 0xFF pad from here to the end of the pointer space. Arming
++             * all of it is free and makes this the one case that cannot be
++             * over-read at all, since 0x100 is unreachable with a one-byte
++             * pointer. 0xFF is also what an idle bus looks like, so it reads as
++             * "nothing here" on the master's console rather than leaking
++             * adjacent memory. */
++            len = (uint16_t)(TB_TX_SPAN - start);
+         }
+ 
+-        (void)HAL_I2C_Slave_Seq_Transmit_IT(hi2c, src, len, I2C_LAST_FRAME);
++        /* Exactly to the end of the addressed block, never past it. Arming MORE
++         * than the master takes looks like the safe choice and is not -- see the
++         * comment on s_tx. */
++        (void)HAL_I2C_Slave_Seq_Transmit_IT(hi2c, &s_tx[start], len,
++                                            I2C_LAST_FRAME);
+     }
+ }
+ 
+@@ -281,7 +526,7 @@ void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c)
+     /* STOP seen. Drop the pointer so a bare read (no pointer write) starts at
+      * register 0 instead of wherever the last transaction happened to end. */
+     s_ptr_valid = false;
+-    (void)HAL_I2C_EnableListen_IT(hi2c);
++    rearm_listen(hi2c);
+ }
+ 
+ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+@@ -304,6 +549,9 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+     }
+ 
+     /* Listening always has to be re-armed after any error, AF included, or the
+-     * slave silently stops answering after the first read. */
+-    (void)HAL_I2C_EnableListen_IT(hi2c);
++     * slave silently stops answering after the first read. On the paths that come
++     * through I2C_ITError() this is REFUSED (State is still LISTEN, which
++     * EnableListen_IT rejects) -- rearm_listen() records that so
++     * tb_slave_service() can reinit instead of trusting the state. */
++    rearm_listen(hi2c);
+ }

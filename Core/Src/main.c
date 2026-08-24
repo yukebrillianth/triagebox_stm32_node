@@ -179,6 +179,17 @@ volatile uint32_t mon_red_raw = 0; /**< latest MAX30102 RED count */
 volatile float mon_ppg_ir_smooth = 0.0f;
 volatile float mon_ppg_red_smooth = 0.0f;
 volatile float mon_ppg_pulse = 0.0f;
+/* The IR pulse as a percentage of its own baseline: the normalised PPG, and the
+ * trace to plot when the amplitude has to mean something. mon_ppg_pulse is in
+ * ADC counts, so its height moves with LED current, sensor distance and how
+ * hard the finger presses; this one divides all three out and reads 0.5-2%
+ * peak-to-peak on any seated finger. Expect a flat 0 with no finger, and a few
+ * seconds of nonsense after boot while the 0.5Hz baseline settles.
+ *
+ * Also the sanity check on mon_spo2_perfusion, which is this same quantity
+ * averaged as RMS over a 1.28s block: if perfusion reads far below the height
+ * of this trace, the block was dominated by something that is not the pulse. */
+volatile float mon_ppg_norm_pct = 0.0f;
 /* 1 when the smoothed RED channel is at or above DSP_PPG_MIN_DC, i.e. a finger
  * is on the sensor. Published as TB_FLAG_PPG_CONTACT. Watch it against
  * mon_ppg_red_smooth: with nothing on the sensor red sits around 2000 counts,
@@ -191,6 +202,41 @@ volatile uint16_t mon_hr_bpm = 0; /**< 0 = no plausible rate found */
 volatile uint8_t mon_ecg_beats = 0; /**< R-peaks in the last window */
 volatile uint16_t mon_ecg_mean = 0; /**< raw ADC mean, electrode-contact hint */
 volatile float mon_ecg_rms = 0.0f; /**< 5-15Hz RMS, signal-quality hint */
+
+/* Pulse rate from the PPG, updated once per 1.28s SpO2 block over a rolling 4s
+ * of pulse waveform. This is NOT mon_hr_bpm measured a second way: HR counts
+ * electrical depolarisations at the chest, PR counts mechanical pulses arriving
+ * at the finger, so a beat too weak to open the aortic valve is in HR and not
+ * here. On a perfusing patient they agree within a beat or two, and a standing
+ * gap between them is a pulse deficit rather than a bug in either.
+ *
+ * Watch all four together, because 0 means three different things:
+ *   pulses 0            -> no pulse found at all (no finger, or no perfusion)
+ *   pulses >0, spread >0.30 -> peaks found, spacing inconsistent: motion, or a
+ *                          genuinely irregular rhythm. A PPG cannot tell those
+ *                          apart, which is why no number is published.
+ *   regular 1, bpm 0    -> rate outside 30-220, i.e. measured and implausible.
+ * Under 40bpm expect 0 regardless: 4s holds fewer than the 3 intervals the
+ * median needs. */
+volatile uint16_t mon_pr_bpm = 0;
+volatile uint8_t mon_pr_pulses = 0;
+volatile uint8_t mon_pr_regular = 0;
+volatile float mon_pr_spread = 0.0f;
+/* Intervals that agreed with the median. Read with mon_pr_pulses: agree ==
+ * pulses-1 is a clean window, and a shortfall is the number of artefacts the
+ * median absorbed while still publishing a rate. This is the pair that shows
+ * whether the sensor mount is good, which mon_pr_spread alone cannot: after the
+ * majority gate, a large spread with regular 1 is a forgiven knock, not a
+ * fault. */
+volatile uint8_t mon_pr_agree = 0;
+/* What actually goes on the wire as "hr": mon_hr_bpm when the ECG is producing
+ * one, mon_pr_bpm otherwise. Kept as its own variable rather than computed at
+ * each of the three publish sites, because three copies of a fallback rule
+ * eventually disagree and the disagreement looks like a link bug.
+ * mon_rate_is_pr says which source won, so a rate on the screen is always
+ * traceable to a sensor. */
+volatile uint16_t mon_rate_bpm = 0;
+volatile uint8_t mon_rate_is_pr = 0;
 
 /* Respiratory rate, updated every 2.5s once the 25.6s window has filled. */
 volatile float mon_resp_brpm = 0.0f; /**< breaths/min, 0 = no reading */
@@ -364,7 +410,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+   HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -549,6 +595,51 @@ int main(void)
 					mon_spo2_pct = 0.0f;
 				}
 			}
+
+			/* ---- Pulse rate, on the same block boundary ---- */
+			/* Gated on the numbers Dsp_Spo2Compute just returned rather than on
+			 * s.valid: SpO2 can be rejected for reasons that say nothing about
+			 * whether a rate is countable (R out of range, an uncalibrated
+			 * percentage below 70), and refusing a good pulse rate because the
+			 * ratio-of-ratios was unhappy would throw away the one vital still
+			 * working. What a rate does need is a finger (DC) and a pulse
+			 * (perfusion), which are exactly the first two gates.
+			 *
+			 * Both thresholds are the SpO2 path's own constants, deliberately:
+			 * "is there a finger with a pulse on the sensor" is one physical
+			 * question and must not acquire a second set of limits that can
+			 * drift apart from the first. */
+			if (s.ir_dc >= DSP_PPG_MIN_DC && s.perfusion >= DSP_SPO2_MIN_PI) {
+				Dsp_PrResult pr;
+				Dsp_PrCompute(&pr);
+				mon_pr_bpm = pr.bpm;
+				mon_pr_pulses = pr.pulses;
+				mon_pr_regular = pr.regular;
+				mon_pr_spread = pr.spread;
+				mon_pr_agree = pr.agree;
+			} else {
+				/* No hold here, unlike SpO2 above. A rate is only as good as the
+				 * contact it was measured through, and the 4s ring is already an
+				 * average - holding a stale one on top of that would put a
+				 * number on screen up to 8s after the finger left. */
+				mon_pr_bpm = 0;
+				mon_pr_pulses = 0;
+				mon_pr_regular = 0;
+				mon_pr_spread = 0.0f;
+				mon_pr_agree = 0;
+			}
+		}
+
+		/* The rate the rest of the system sees. Recomputed every pass, not
+		 * inside either producer's block, so neither source can stall the
+		 * other's updates: if the MAX30102 stops answering, PPG blocks stop
+		 * completing, and a fresh ECG rate must still reach the wire. */
+		if (mon_hr_bpm > 0U) {
+			mon_rate_bpm = mon_hr_bpm;
+			mon_rate_is_pr = 0;
+		} else {
+			mon_rate_bpm = mon_pr_bpm;
+			mon_rate_is_pr = (mon_pr_bpm > 0U) ? 1U : 0U;
 		}
 
 		/* ---- LoRa: answer the station if it asked ---- */
@@ -567,6 +658,7 @@ int main(void)
 		 * pass is serviced this pass, and publish last, so the tag it found is
 		 * in the very next snapshot the ESP32 reads. The other way round costs
 		 * two full loops of latency on every scan. */
+		tb_slave_service(); /* unwedge the bus first, or none of the rest lands */
 		{
 			uint8_t cmd = tb_slave_take_cmd();
 			if (cmd != TB_CMD_NONE) {
@@ -735,10 +827,33 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
  * DSP_SPO2_REJ_SPO2_LOW (reject code 5). Swapped here, at the one and only
  * place the driver's labels cross into application code.
  *
- * MON_SPO2_SWAP_CHANNELS exists because this rests on the datasheet register
- * map rather than a measurement on your board. Set it to 0 to pass the driver's
- * labels through unchanged; check mon_spo2_ir_dc > mon_spo2_red_dc, which is
- * true for a real finger since tissue attenuates red far more than infrared. */
+ * MON_SPO2_SWAP_CHANNELS exists because the above rests on the datasheet
+ * register map rather than on a measurement of THIS board. It has now been tried
+ * both ways on hardware and the swap stays ON -- but read the next paragraph
+ * before flipping it, because the obvious check is the misleading one.
+ *
+ * The tempting test is mon_spo2_ir_dc > mon_spo2_red_dc, on the grounds that
+ * tissue attenuates 660nm far more than 880nm. That test HAS A PRECONDITION:
+ * the light must have gone through tissue. Used with an air gap, a large
+ * wavelength-flat shunt -- reflection off the package and the skin surface,
+ * never entering the finger -- dominates DC, so which channel reads larger is
+ * then set by LED-to-photodiode geometry (the two dies are not equidistant from
+ * the detector) rather than by haemoglobin. Measured 2026-08-22: the two DC
+ * values sat only 1.14x apart, 160k against 140k, either way round. That
+ * compression is the shunt, and it is why the DC test cannot arbitrate here.
+ *
+ * R is what arbitrates, because AC can only come from pulsating blood. R is
+ * exactly reciprocal between the two settings, so one of them is always
+ * physiological and the other always absurd. Swap OFF gave R ~1.5 on a healthy
+ * finger: 70-75%, flickering to DSP_SPO2_REJ_SPO2_LOW whenever R crossed 1.6.
+ * Swap ON is the reciprocal, R ~0.65 -> ~94%. Expect 0.4-0.9 on a healthy
+ * subject; R > 1 is either real severe hypoxia or this macro being wrong, and on
+ * someone walking and talking it is this macro.
+ *
+ * Whichever way it is set, perfusion (ir_ac/ir_dc) is computed on whatever this
+ * call labels IR. Backwards, it is measured on the physically-red channel, which
+ * carries the smaller AC -- so perfusion reads low and unstable while the
+ * percentage can still look plausible. */
 #define MON_SPO2_SWAP_CHANNELS 1
 
 /* The wire block declares the waveform's sample rate so the ESP32 can put a
@@ -763,6 +878,7 @@ void max30102_plot(uint32_t ir_sample, uint32_t red_sample) {
 	mon_ppg_ir_smooth = smooth.ir;
 	mon_ppg_red_smooth = smooth.red;
 	mon_ppg_pulse = smooth.pulse;
+	mon_ppg_norm_pct = smooth.norm_pct;
 
 	/* Skin contact, from the SAME floor the SpO2 DC gate uses, so the waveform
 	 * and the percentage can never disagree about whether a finger is present.
@@ -807,7 +923,11 @@ static void PackTelemetry(void) {
 	mon_lora_vital.flags = mon_flags;
 	mon_lora_vital.device_status = mon_sensor_ok;
 
-	mon_lora_vital.hr = mon_hr_bpm;
+	/* mon_rate_bpm, not mon_hr_bpm: the ECG rate when there is one, the PPG pulse
+	 * rate otherwise. mon_flags carries TB_FLAG_HR_FROM_PPG so the station can
+	 * see which, and the field itself stays "hr" so the MQTT contract does not
+	 * move. */
+	mon_lora_vital.hr = mon_rate_bpm;
 	mon_lora_vital.spo2 = (uint8_t) ((spo2 > 100.0f) ? 100U :
 										(spo2 > 0.0f) ? (uint8_t) (spo2 + 0.5f) : 0U);
 	/* Whole breaths/min, and clamped because the field is one byte: the resp
@@ -1104,6 +1224,12 @@ static void PublishToEsp32(void) {
 	if (mon_hr_bpm > 0U) {
 		flags |= TB_FLAG_HR_VALID;
 		sensors |= TB_SENSOR_ECG;
+	} else if (mon_pr_bpm > 0U) {
+		/* A pulse rate is a valid rate, so TB_FLAG_HR_VALID is set and the
+		 * number is published -- but TB_SENSOR_ECG is NOT, because the ECG did
+		 * not produce it and a status dot claiming a working ECG would send
+		 * someone looking for a fault that is already known. */
+		flags |= TB_FLAG_HR_VALID | TB_FLAG_HR_FROM_PPG;
 	}
 	if (mon_spo2_valid != 0U) {
 		flags |= TB_FLAG_SPO2_VALID;
@@ -1150,7 +1276,7 @@ static void PublishToEsp32(void) {
 	mon_flags = flags;
 	mon_sensor_ok = sensors;
 
-	tb_slave_publish(flags, mon_buttons, mon_hr_bpm,
+	tb_slave_publish(flags, mon_buttons, mon_rate_bpm,
 			(uint16_t) (mon_spo2_pct + 0.5f),
 			(uint16_t) ((mon_resp_brpm * 10.0f) + 0.5f),
 			0U, /* bp_sys: no source yet */
@@ -1168,6 +1294,22 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
 	/* User can add his own implementation to report the HAL error return state */
+
+	/* Let go of I2C2 before going quiet. Those pins are the ESP32's only I2C
+	 * bus -- GT911 touch, TCA9554 display expander, SW6106 PMIC -- and an
+	 * enabled I2C slave whose interrupts never run holds SCL low from the first
+	 * address match onwards. The ESP32 then dies in bsp_display_start() on the
+	 * GT911 probe, before a single LVGL screen is loaded, which on the panel
+	 * looks like "the LCD is always white when the STM32 is connected". Clearing
+	 * PE releases SCL and SDA, so a dead STM32 costs vitals, not the whole UI.
+	 *
+	 * Guarded because Error_Handler() is also reachable from SystemClock_Config,
+	 * before MX_I2C2_Init() has set hi2c2.Instance -- dereferencing NULL there
+	 * would trade this hang for a HardFault. */
+	if (hi2c2.Instance != NULL) {
+		__HAL_I2C_DISABLE(&hi2c2);
+	}
+
 	__disable_irq();
 	while (1) {
 	}

@@ -9,9 +9,10 @@
  *
  * This is NOT a CMSIS implementation and must never become one. It declares no
  * arm_* function, so any test that tries to actually filter something fails to
- * link rather than quietly testing a fake DSP library. dsp_utils.h itself only
- * needs arm_math.h for the __has_include check at its top and for float32_t in
- * the .c file; every declaration in the header uses plain `float`.
+ * link rather than quietly testing a fake DSP library. What dsp_utils.h needs
+ * from here is the __has_include check at its top and float32_t, which the
+ * mon_ecg_filtered declaration uses; every function signature in the header
+ * uses plain `float`.
  *
  * Reach it with -I tools/stub, and only for tests that want the constants.
  */

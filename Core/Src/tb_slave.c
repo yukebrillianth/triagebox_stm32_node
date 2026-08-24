@@ -18,6 +18,16 @@
 volatile uint32_t mon_i2c_reads = 0;
 volatile uint32_t mon_i2c_writes = 0;
 volatile uint32_t mon_i2c_errors = 0;
+volatile uint32_t mon_i2c_recoveries = 0;
+
+/* How long the slave may look wedged before tb_slave_service() re-inits it.
+ * Longer than the ESP32's 50 ms poll and than any single transaction (the
+ * 132-byte PPG read is ~13 ms at 100 kHz), short enough that a jam clears
+ * before the ESP32 finishes booting and gives up on the bus. */
+#define TB_SLAVE_STUCK_MS 1000U
+
+/* Last tick at which the slave was armed and listening. */
+static uint32_t s_healthy_ms = 0;
 
 /*
  * Double buffer. The superloop fills s_stage; the ISR only ever touches
@@ -111,6 +121,71 @@ void tb_slave_init(void)
 
     if (HAL_I2C_EnableListen_IT(&hi2c2) != HAL_OK) {
         Error_Handler();
+    }
+
+    s_healthy_ms = HAL_GetTick();
+}
+
+/*
+ * Watchdog for a wedged slave. Call from the superloop.
+ *
+ * Healthy means one exact thing: HAL state LISTEN -- armed, between
+ * transactions. Anything else that PERSISTS for TB_SLAVE_STUCK_MS is a wedge:
+ * stuck mid-transfer (BUSY_TX_LISTEN / BUSY_RX_LISTEN) while holding SCL low, or
+ * listening lost entirely (READY) because a re-arm failed on an error path.
+ * Recovery is DeInit/Init/EnableListen; MspDeInit puts PB10/PB3 back to analog,
+ * which releases both lines. The published snapshot is untouched.
+ *
+ * This matters because I2C2's pins are the ESP32's ONLY I2C bus, shared with the
+ * GT911 touch controller, the TCA9554 display expander and the SW6106 PMIC. A
+ * slave holding SCL takes all three down, and it shows up as a white panel with
+ * no UI -- nothing on the ESP32 side can clear it.
+ *
+ * WHAT THIS CANNOT SEE, so never read mon_i2c_recoveries == 0 as "the bus is
+ * fine": a transmit under-run, where the master clocks past the armed length.
+ * I2C_SlaveTransmit_TXE() sets State back to LISTEN as soon as the last armed
+ * byte reaches DR, so the wedge looks armed and idle and this function refreshes
+ * s_healthy_ms every pass while SCL is on the floor. There is no state to test
+ * for. The only defence is to keep the master's read length equal to the block
+ * length; see HAL_I2C_AddrCallback.
+ *
+ * SR2's BUSY flag is deliberately NOT part of the test: it tracks the bus rather
+ * than us, so it sets when the ESP32 talks to the touch controller, and testing
+ * it would re-init a perfectly healthy slave because of someone else's traffic.
+ *
+ * ponytail: only fixes the case where WE hold the bus. If the ESP32 side holds a
+ * line low the STM32 cannot clear it -- that needs the nine-clock master recovery
+ * pulse with PB10 driven as GPIO. Add it if mon_i2c_recoveries climbs but the
+ * panel stays white.
+ */
+void tb_slave_service(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_LISTEN) {
+        s_healthy_ms = now;
+        return;
+    }
+    if ((now - s_healthy_ms) < TB_SLAVE_STUCK_MS) {
+        return; /* mid-transaction; let it finish normally */
+    }
+
+    ++mon_i2c_recoveries;
+    s_healthy_ms = now;
+
+    HAL_I2C_DeInit(&hi2c2);
+    s_ptr = 0U;
+    s_ptr_valid = false;
+    if (HAL_I2C_Init(&hi2c2) != HAL_OK) {
+        /* Do NOT call Error_Handler() here: it never returns, and an I2C2 left
+         * enabled with no ISR stretches SCL forever on the next address match --
+         * which is the whole fault this function exists to clear. A dead link is
+         * bad; a dead panel is worse. */
+        __HAL_I2C_DISABLE(&hi2c2);
+        return;
+    }
+    if (HAL_I2C_EnableListen_IT(&hi2c2) != HAL_OK) {
+        __HAL_I2C_DISABLE(&hi2c2);
     }
 }
 

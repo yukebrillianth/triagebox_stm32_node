@@ -30,6 +30,19 @@
 void tb_slave_init(void);
 
 /*
+ * Superloop tick. Re-inits I2C2 if the slave has been wedged -- stuck
+ * mid-transfer, or no longer listening -- for a second or more.
+ *
+ * Not optional politeness: I2C2's pins are the ESP32's *only* I2C bus, shared
+ * with the GT911 touch controller, the TCA9554 display expander and the SW6106
+ * PMIC. A slave that holds SCL low takes all three with it, and on the ESP32 it
+ * shows as a white screen with no UI -- bsp_display_start() fails on the GT911
+ * probe before the first LVGL screen is ever loaded. Nothing on the ESP32 side
+ * can clear that; only this can.
+ */
+void tb_slave_service(void);
+
+/*
  * Publish a consistent snapshot for the master to read. Call from the superloop
  * with the latest values; cheap (a struct fill plus a memcpy of ~48 bytes).
  *
@@ -70,5 +83,9 @@ bool tb_slave_take_result(uint8_t *priority, uint8_t *confidence);
 extern volatile uint32_t mon_i2c_reads;   /**< completed master reads */
 extern volatile uint32_t mon_i2c_writes;  /**< completed master writes */
 extern volatile uint32_t mon_i2c_errors;  /**< bus errors, incl. recovered AF */
+extern volatile uint32_t mon_i2c_recoveries; /**< wedged-bus re-inits; >0 means
+                                                  the bus jammed at least once.
+                                                  0 is NOT proof it did not --
+                                                  see tb_slave_service(). */
 
 #endif /* TB_SLAVE_H */
