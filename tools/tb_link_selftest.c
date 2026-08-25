@@ -53,15 +53,42 @@ static void test_layout(void)
     assert(offsetof(tb_snapshot_t, sensor_ok) == TB_REG_SENSOR_OK);
     assert(offsetof(tb_snapshot_t, rfid_len)  == TB_REG_RFID_LEN);
     assert(offsetof(tb_snapshot_t, rfid)      == TB_REG_RFID);
+    assert(offsetof(tb_snapshot_t, lora_rssi) == TB_REG_LORA_RSSI);
 
     /* No tail padding: the slave transmits sizeof(tb_snapshot_t) bytes, so any
-     * padding would be junk on the wire and would shift TB_REG_READ_END. */
-    assert(sizeof(tb_snapshot_t) == TB_REG_READ_END);
-    assert(sizeof(tb_snapshot_t) == 0x30U);
+     * padding would be junk on the wire and would shift TB_REG_SNAPSHOT_END. */
+    assert(sizeof(tb_snapshot_t) == TB_REG_SNAPSHOT_END);
+    assert(sizeof(tb_snapshot_t) == 0x31U);
+
+    /*
+     * lora_rssi sits one byte PAST the vitals block, and that gap is what lets
+     * the two boards be flashed independently: the ESP32's 50 ms poll still asks
+     * for exactly TB_REG_READ_END bytes, which is what an STM32 built before this
+     * field served. Fold it inside the block and every poll from a new ESP32 asks
+     * an old slave for one byte more than s_tx holds -- a failed poll, i.e. a
+     * link that looks dead, in exchange for saving one 1-byte read per second.
+     */
+    assert(TB_REG_READ_END == 0x30U);
+    assert(TB_REG_LORA_RSSI == TB_REG_READ_END);
+    assert(TB_REG_SNAPSHOT_END == TB_REG_READ_END + 1U);
+
+    /*
+     * Two different bytes mean "no reading", from two different places, so the
+     * validity test is a range and not `!= SENTINEL`:
+     *   0x00  this node has not heard a poll yet (polls are 15 s apart)
+     *   0xFF  the AddrCallback pad, i.e. an old STM32 or an address it refuses
+     * Both are above the strongest real signal, so the upper bound rejects both.
+     */
+    assert(!tb_rssi_valid(0));
+    assert(!tb_rssi_valid((int8_t)0xFFU));
+    assert(tb_rssi_valid(-123)); /* SF7/125k sensitivity, about the weakest real */
+    assert(tb_rssi_valid(TB_RSSI_MAX_DBM));
+    assert(!tb_rssi_valid(TB_RSSI_MAX_DBM + 1));
 
     /* Read and write blocks must not overlap; the slave enforces read-only on
      * everything outside the write block by switching on the pointer. */
     assert(TB_REG_READ_END <= TB_REG_CMD);
+    assert(TB_REG_SNAPSHOT_END <= TB_REG_CMD);
 
     /* The write block is contiguous and WRITE_END is one past its last register.
      * tb_slave.c switches on the pointer, so a register at or past WRITE_END is

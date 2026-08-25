@@ -50,6 +50,7 @@ static GPIO_TypeDef port_a;
 static volatile uint16_t mon_lora_frames;
 static volatile uint32_t mon_lora_rx, mon_lora_polls, mon_lora_crc;
 static volatile uint32_t mon_lora_stale, mon_lora_reply_ms;
+static volatile int16_t mon_lora_rssi;
 static lora_vital_t mon_lora_vital;
 
 /* ---- scripted radio ---- */
@@ -124,6 +125,40 @@ static void PackTelemetry(void)
 	mon_lora_vital.packet_counter = 7U;
 }
 
+/*
+ * The real LoRa_getRSSI() is `-164 + RegPktRssiValue`, so it returns whatever
+ * the byte gives it -- including values int8_t cannot hold. Scriptable here
+ * precisely so the clamp in ServiceLoRaPoll() can be tested with those: the
+ * failure it exists to stop is -164 narrowing to +92, which passes every
+ * plausibility test and displays as an unusually strong signal.
+ */
+static int fake_rssi = -97;
+static unsigned rssi_reads;
+
+static int LoRa_getRSSI(LoRa *l)
+{
+	(void) l;
+	++rssi_reads;
+	return fake_rssi;
+}
+
+/* What ServiceLoRaPoll() handed to the I2C link, and whether it handed anything
+ * at all -- the ordering matters as much as the value (see the test). */
+static int8_t published_rssi;
+static unsigned rssi_publishes;
+
+static void tb_slave_set_rssi(int8_t dbm)
+{
+	published_rssi = dbm;
+	++rssi_publishes;
+	/* The reply has not gone out yet when this is called. Asserted here rather
+	 * than in the test body because the ordering is the whole reason the latch
+	 * sits where it does: LoRa_transmit() returns the radio to RX continuous,
+	 * where the next packet heard overwrites RegPktRssiValue -- very likely
+	 * another node answering its own poll on this shared channel. */
+	assert(tx_count == 0U);
+}
+
 #include "svc_body.inc" /* the function under test, generated from main.c */
 
 /* ---- driving it ---- */
@@ -147,8 +182,11 @@ static void reset_counters(void)
 	mon_lora_rx = mon_lora_polls = mon_lora_crc = 0;
 	mon_lora_stale = mon_lora_reply_ms = 0;
 	mon_lora_frames = 0;
+	mon_lora_rssi = 0;
 	tx_count = flags_cleared = reads = 0;
 	tx_last_len = 0;
+	rssi_reads = rssi_publishes = 0;
+	published_rssi = 0;
 }
 
 /* One pass of the superloop: dt ms since the previous pass. */
@@ -260,6 +298,58 @@ int main(void)
 	pass(10U);
 	assert(reads == 0U && tx_count == 0U && flags_cleared == 0U);
 	lora_status = LORA_OK;
+
+	/* ---- RSSI latch ---- */
+
+	/* A normal poll: read once, published once, value passed through. */
+	reset_counters();
+	fake_rssi = -97;
+	arm_poll(0x01U, LORA_POLL_CMD_REPORT);
+	pass(10U);
+	assert(rssi_reads == 1U && rssi_publishes == 1U);
+	assert(published_rssi == -97);
+	assert(mon_lora_rssi == -97);
+
+	/*
+	 * THE CLAMP. RegPktRssiValue == 0 makes LoRa_getRSSI() return -164, and
+	 * -164 narrowed to int8_t is +92 -- a value the ESP32's tb_rssi_valid()
+	 * would ACCEPT and display as an extremely strong signal, which is the
+	 * worst possible direction for a number someone is using to judge range.
+	 * Pinned to -128 so it lands outside the valid window instead.
+	 */
+	reset_counters();
+	fake_rssi = -164;
+	arm_poll(0x01U, LORA_POLL_CMD_REPORT);
+	pass(10U);
+	assert(published_rssi == -128);
+	assert(mon_lora_rssi == -164); /* CubeMonitor sees the raw figure */
+
+	/* The other end of the library's range, which is also not a real level. */
+	reset_counters();
+	fake_rssi = 91;
+	arm_poll(0x01U, LORA_POLL_CMD_REPORT);
+	pass(10U);
+	assert(published_rssi == 91); /* fits int8_t; the ESP32 rejects it by range */
+
+	/* A poll for another node must NOT move it: that packet's level describes
+	 * the station's link to somebody else, and on a 20-node channel it is the
+	 * common case, so adopting it would make this node's own reading wander. */
+	reset_counters();
+	fake_rssi = -60;
+	arm_poll(0x02U, LORA_POLL_CMD_REPORT);
+	pass(10U);
+	assert(rssi_reads == 0U && rssi_publishes == 0U);
+
+	/* Stale is rejected AFTER the latch: the poll was genuinely heard, so its
+	 * level is real even though the reply was suppressed. Range-testing at the
+	 * edge is exactly when replies start missing their slot, and that is the
+	 * moment the number matters most. */
+	reset_counters();
+	fake_rssi = -118;
+	arm_poll(0x01U, LORA_POLL_CMD_REPORT);
+	pass(LORA_REPLY_DEADLINE_MS + 1U);
+	assert(mon_lora_stale == 1U && tx_count == 0U);
+	assert(rssi_publishes == 1U && published_rssi == -118);
 
 	printf("lora_poll_selftest: OK (ServiceLoRaPoll)\n");
 	return 0;

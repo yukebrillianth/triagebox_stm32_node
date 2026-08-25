@@ -252,6 +252,46 @@ Kept as a checklist because it is what a second node type would have to satisfy.
    `tb_slave_host_battery()` or 0xFF if there is no reading.
 6. Transmit `lora_vital_len(&v)` bytes, well inside 250 ms of the poll arriving.
 7. Straight back to RX. Never transmit from anywhere else in the firmware.
+8. Latch `LoRa_getRSSI()` **before** transmitting — see below.
+
+## Downlink RSSI goes to the ESP32, not to the station
+
+The node's radio sits in RX continuous and hears every poll, so
+`RegPktRssiValue` after RxDone is a real measurement **at the node's position**.
+That is the only link-quality figure a node can know: it never transmits
+unpolled, so it never measures the uplink. The ESP32 shows it in its status bar,
+which is what someone walking the box away from the station reads to find the
+range. Path loss is reciprocal, so the downlink figure answers that question.
+
+Nothing goes on the air for this. The station measures the uplink with its own
+radio and publishes it in the node status JSON; a second field here would say the
+same thing at the cost of airtime 20 times a cycle.
+
+It crosses to the ESP32 as one I²C register, `TB_REG_LORA_RSSI` (`0x30`), one
+byte past the vitals block — so the ESP32's 50 ms poll still reads exactly
+`TB_REG_READ_END` bytes and `TB_PROTO_VER` did not move. Either board can be
+flashed without the other.
+
+Three things that are easy to get wrong:
+
+**Latch before `LoRa_transmit()`.** `RegPktRssiValue` is per-packet, and
+transmitting returns the radio to RX continuous, where the next packet heard is
+very likely another node answering its own poll on this shared channel — which
+overwrites the register with *that* node's level.
+
+**Clamp it.** `LoRa_getRSSI()` returns `-164 + RegPktRssiValue`, so its range is
+`-164..+91`. `-164` narrowed to `int8_t` wraps to **+92**, which passes every
+plausibility test and displays as an unusually *strong* signal — the worst
+possible direction for a number being used to judge range. `mon_lora_rssi` keeps
+the unclamped value for CubeMonitor, because a reading pinned at -128 hides
+whether the register read is broken or the signal is genuinely at the floor.
+
+**Only for polls addressed to this node.** A poll for somebody else describes the
+station's link to somebody else, and on a 20-node channel that is the common
+case. Adopting it makes this node's own reading wander. The latch therefore sits
+after `lora_poll_for_me()`, but *before* the stale-reply check: a poll that
+arrived too late to answer was still genuinely heard, and range-testing at the
+edge is exactly when replies start missing their slot.
 
 ## Bringing the link up for the first time
 
