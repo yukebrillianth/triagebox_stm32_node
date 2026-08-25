@@ -939,7 +939,10 @@ static void PackTelemetry(void) {
 	 * station omits the keys rather than publishing a fabricated 0/0. */
 	mon_lora_vital.bp_sys = 0U;
 	mon_lora_vital.bp_dia = 0U;
-	mon_lora_vital.battery = LORA_VITAL_BATTERY_NONE;
+	/* The gauge is the ESP32's SW6106 PMIC, not ours -- it arrives over I2C at
+	 * TB_REG_HOST_BATTERY. 0xFF when it has not sent one yet, which is exactly
+	 * LORA_VITAL_BATTERY_NONE, so the station omits the key as before. */
+	mon_lora_vital.battery = tb_slave_host_battery();
 
 	/* Whatever the ESP32 last decided, or NONE if it has not decided yet. */
 	mon_lora_vital.priority = mon_priority;
@@ -1281,7 +1284,12 @@ static void PublishToEsp32(void) {
 			(uint16_t) ((mon_resp_brpm * 10.0f) + 0.5f),
 			0U, /* bp_sys: no source yet */
 			0U, /* bp_dia: no source yet */
-			0xFFU, /* battery: not measured on this board */
+			/* Echoed back rather than left at 0xFF: TB_REG_BATTERY is "the
+			 * node's battery" to everyone reading this block, and there is
+			 * exactly one gauge on this node. Echoing also makes the write
+			 * verifiable with `i2creg` -- if it reads back 0xFF, the ESP32's
+			 * write never landed. */
+			tb_slave_host_battery(),
 			sensors, rfid_ascii, rfid_ascii_len);
 }
 /* USER CODE END 4 */

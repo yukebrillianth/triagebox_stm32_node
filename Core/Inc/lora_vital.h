@@ -67,9 +67,12 @@
 #define LORA_VITAL_PRIORITY_GREEN  0x03U
 #define LORA_VITAL_PRIORITY_NONE   0xFFU
 
-/* battery: percent, or this if the board has no fuel gauge (it currently does
- * not). The station emits null / omits the key; it must not publish 0, which
- * reads as a flat battery. Same convention as TB_REG_BATTERY. */
+/* battery: percent, or this when no reading is available. The gauge is the
+ * SW6106 PMIC on the ESP32's side of the I2C link, so this is 0xFF until the
+ * ESP32 has written one to TB_REG_HOST_BATTERY -- for the first seconds after
+ * boot, and whenever that read fails. The station emits null / omits the key; it
+ * must not publish 0, which reads as a flat battery. Same convention as
+ * TB_REG_BATTERY. */
 #define LORA_VITAL_BATTERY_NONE 0xFFU
 
 /*

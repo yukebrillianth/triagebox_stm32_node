@@ -66,6 +66,12 @@ static volatile uint8_t s_priority;
 static volatile uint8_t s_confidence;
 static volatile bool s_result_fresh = false;
 
+/* The ESP32's fuel-gauge reading, which this board cannot take itself. 0xFF
+ * until it writes one, and 0xFF is "no reading" rather than 0% -- see
+ * TB_REG_HOST_BATTERY. Not a "take": this is state like the button bitmask, so a
+ * read that misses an update costs nothing and there is nothing to drain. */
+static volatile uint8_t s_host_battery = 0xFFU;
+
 static void arm_receive(void)
 {
     /* One byte at a time. It costs an interrupt per byte, but each one is a
@@ -254,6 +260,11 @@ bool tb_slave_take_result(uint8_t *priority, uint8_t *confidence)
     return true;
 }
 
+uint8_t tb_slave_host_battery(void)
+{
+    return s_host_battery;
+}
+
 /* ---- ISR half: copies bytes, nothing else ------------------------------- */
 
 void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection,
@@ -328,6 +339,12 @@ void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c)
             s_confidence = byte;
             /* Confidence is written last, so the pair is complete here. */
             s_result_fresh = true;
+            break;
+        case TB_REG_HOST_BATTERY:
+            /* Taken as-is, 0xFF included: that value is the ESP32 saying it
+             * could not read the gauge, and passing it through unchanged is what
+             * makes the station omit the key instead of reporting a flat pack. */
+            s_host_battery = byte;
             break;
         default:
             break;

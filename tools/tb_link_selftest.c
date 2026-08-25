@@ -63,6 +63,21 @@ static void test_layout(void)
      * everything outside the write block by switching on the pointer. */
     assert(TB_REG_READ_END <= TB_REG_CMD);
 
+    /* The write block is contiguous and WRITE_END is one past its last register.
+     * tb_slave.c switches on the pointer, so a register at or past WRITE_END is
+     * silently ignored -- which is how an unpatched STM32 keeps working, and also
+     * how a new register nobody added to the switch would fail. */
+    assert(TB_REG_PRIORITY == TB_REG_CMD + 1U);
+    assert(TB_REG_CONFIDENCE == TB_REG_PRIORITY + 1U);
+    assert(TB_REG_HOST_BATTERY == TB_REG_CONFIDENCE + 1U);
+    assert(TB_REG_WRITE_END == TB_REG_HOST_BATTERY + 1U);
+
+    /* HOST_BATTERY is written by the master; TB_REG_BATTERY is read by it. Two
+     * registers, two directions, one value -- they must not be the same address
+     * or the ESP32's write would land on top of what it is about to read. */
+    assert(TB_REG_HOST_BATTERY != TB_REG_BATTERY);
+    assert(TB_REG_HOST_BATTERY >= TB_REG_CMD);
+
     /* The HAL wants the address shifted; ESP-IDF does not. Both sides derive
      * from the same constant, so check the shift itself. */
     assert(TB_I2C_SLAVE_ADDR_HAL == 0x84U);
@@ -395,8 +410,10 @@ static void test_lora_vital_valid(void)
     assert(!lora_vital_valid(&v, LORA_VITAL_FIXED_LEN + 7U));
     assert(lora_vital_valid(&v, LORA_VITAL_FIXED_LEN + 8U));
 
-    /* Battery has to distinguish "flat" from "no gauge", the same way the I2C
-     * map does, or the station publishes 0% for a board with no fuel gauge. */
+    /* Battery has to distinguish "flat" from "no reading", the same way the I2C
+     * map does, or the station publishes 0% for a gauge it could not read.
+     * main.c copies TB_REG_HOST_BATTERY straight into this field, so the two
+     * sentinels are the same byte: 0xFF at both ends, and never 0. */
     assert(LORA_VITAL_BATTERY_NONE == 0xFFU);
     assert(LORA_VITAL_BATTERY_NONE != 0U);
 }
