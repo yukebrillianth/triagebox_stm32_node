@@ -79,6 +79,17 @@ uint8_t tb_slave_take_cmd(void);
  */
 bool tb_slave_take_result(uint8_t *priority, uint8_t *confidence);
 
+/*
+ * The ESP32's fuel-gauge percentage, or 0xFF if it has not sent one or could not
+ * read the PMIC. NOT a take -- this is state, so call it as often as you like.
+ *
+ * Substitute it for the STM32's own battery field when publishing: this board has
+ * no gauge of its own, and the gauge that exists sits on the ESP32's side of the
+ * bus. Pass 0xFF through rather than mapping it to 0; the station omits the JSON
+ * key for 0xFF and reports a flat pack for 0.
+ */
+uint8_t tb_slave_host_battery(void);
+
 /* Diagnostics for CubeMonitor / a status register later. */
 extern volatile uint32_t mon_i2c_reads;   /**< completed master reads */
 extern volatile uint32_t mon_i2c_writes;  /**< completed master writes */

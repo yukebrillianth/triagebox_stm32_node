@@ -112,7 +112,10 @@ field is there.
 
 `priority` 0xFF means "not scored yet"; the station omits the JSON key rather than
 publishing a level. Do not send 0 for unscored, because 0 is BLACK. Same for
-`battery`: 0xFF means "no fuel gauge", 0 means a flat battery.
+`battery`: 0xFF means "no reading", 0 means a flat battery. The gauge is the
+SW6106 PMIC on the ESP32's side of the I²C link, so this field is filled from
+`TB_REG_HOST_BATTERY` — 0xFF for the first seconds after boot and whenever that
+read fails, a real percentage otherwise.
 
 `flags` decides which vitals are published at all. The station tests
 `TB_FLAG_HR_VALID`, `TB_FLAG_SPO2_VALID`, `TB_FLAG_RR_VALID` and
@@ -245,8 +248,8 @@ Kept as a checklist because it is what a second node type would have to satisfy.
 3. On a packet, `lora_poll_for_me(p, len, MY_NODE_ID)`. False → back to RX, no log.
 4. Unknown command → back to RX, silently.
 5. `LORA_POLL_CMD_REPORT` → snapshot, fill `lora_vital_t`, `node_id` = own id,
-   `version` = 0x01, flags set honestly, unscored priority = 0xFF, no gauge
-   battery = 0xFF.
+   `version` = 0x01, flags set honestly, unscored priority = 0xFF, battery from
+   `tb_slave_host_battery()` or 0xFF if there is no reading.
 6. Transmit `lora_vital_len(&v)` bytes, well inside 250 ms of the poll arriving.
 7. Straight back to RX. Never transmit from anywhere else in the firmware.
 
