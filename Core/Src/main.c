@@ -310,12 +310,18 @@ volatile uint32_t mon_lora_frames = 0;
  *
  * mon_lora_reply_ms is the last poll-to-transmit-done latency in ms. The whole
  * design rests on it staying well under LORA_POLL_SLOT_MS (250), so it is the
- * one number to look at before believing the timing contract holds. */
+ * one number to look at before believing the timing contract holds.
+ *
+ * mon_lora_rssi is the last poll's RSSI in dBm, UNCLAMPED -- int16_t because
+ * LoRa_getRSSI() can legitimately return values outside int8_t, and seeing the
+ * raw figure here is more useful than seeing it pinned. The clamped copy is what
+ * goes to the ESP32; see the latch in ServiceLoRaPoll(). */
 volatile uint32_t mon_lora_rx = 0;
 volatile uint32_t mon_lora_polls = 0;
 volatile uint32_t mon_lora_crc = 0;
 volatile uint32_t mon_lora_stale = 0;
 volatile uint32_t mon_lora_reply_ms = 0;
+volatile int16_t mon_lora_rssi = 0;
 
 /* ---- ESP32 I2C link ----------------------------------------------------- */
 /* Debounce state for the 4 front-panel buttons. The published byte is
@@ -1066,6 +1072,40 @@ static void ServiceLoRaPoll(void) {
 		return;
 	}
 	++mon_lora_polls;
+
+	/*
+	 * RSSI of THIS packet, latched now: the poll is confirmed to be from the
+	 * station, so the level means something. It goes to the ESP32 over I2C for
+	 * its status bar -- the only link-quality figure this node can know, since
+	 * it never transmits unpolled and so only ever measures the downlink.
+	 *
+	 * BEFORE the reply, deliberately. RegPktRssiValue is per-packet, and
+	 * LoRa_transmit() returns the radio to RX continuous, where the next thing
+	 * heard is very likely another node answering its own poll on this shared
+	 * channel -- which would overwrite the register with that node's level.
+	 *
+	 * The clamp is load-bearing, not defensive. LoRa_getRSSI() returns
+	 * -164 + RegPktRssiValue, so its range is -164..+91, and -164 narrowed to
+	 * int8_t wraps to +92: a value that passes every plausibility test and
+	 * displays as an extremely strong signal. Clamping to int8_t's range keeps
+	 * the out-of-band values ABOVE the strongest real signal, where
+	 * tb_rssi_valid() rejects them.
+	 */
+	{
+		int rssi = LoRa_getRSSI(&hlora);
+
+		/* Raw first, so CubeMonitor shows what the radio actually reported --
+		 * a reading pinned at -128 hides whether the register read is broken
+		 * (0 -> -164) or the signal is genuinely at the floor. */
+		mon_lora_rssi = (int16_t) rssi;
+
+		if (rssi < -128) {
+			rssi = -128;
+		} else if (rssi > 127) {
+			rssi = 127;
+		}
+		tb_slave_set_rssi((int8_t) rssi);
+	}
 
 	if (age > LORA_REPLY_DEADLINE_MS) {
 		/* Deliberately silent on the radio: see LORA_REPLY_DEADLINE_MS.

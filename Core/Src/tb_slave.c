@@ -228,9 +228,18 @@ void tb_slave_publish(uint8_t flags, uint8_t buttons, uint16_t hr,
     HAL_NVIC_EnableIRQ(I2C2_EV_IRQn);
 }
 
-void tb_slave_ppg_push(float ir, float red)
+/*
+ * See tb_slave.h for why this is a setter and not another publish parameter.
+ * No critical section: a single byte store into the staging copy the superloop
+ * owns, and the ISR only ever reads s_live.
+ */
+void tb_slave_set_rssi(int8_t dbm)
 {
-    /* All of it is in tb_regs.h, next to the layout it has to agree with, and
+    s_stage.lora_rssi = dbm;
+}
+
+void tb_slave_ppg_push(float ir, float red)
+{    /* All of it is in tb_regs.h, next to the layout it has to agree with, and
      * host-tested there -- see tb_ppg_push() for why total is stored last. */
     tb_ppg_push(&s_ppg, ir, red);
 }

@@ -55,6 +55,27 @@ void tb_slave_publish(uint8_t flags, uint8_t buttons, uint16_t hr,
                       const char *rfid, uint8_t rfid_len);
 
 /*
+ * Downlink RSSI in dBm: how strongly this node heard the station's last poll.
+ * The ESP32 shows it in its status bar, which is what someone walking the box
+ * away from the station reads to find the range.
+ *
+ * A SETTER rather than another tb_slave_publish() parameter, because the two run
+ * on different clocks: a poll arrives once per LORA_POLL_PERIOD_MS (15 s) while
+ * publish runs every superloop pass. As a parameter, every caller would have to
+ * remember the last value and pass it back in, and the one that forgot would
+ * publish 0 -- which reads as "no poll heard yet" and would blank the number for
+ * most of every cycle.
+ *
+ * Lands in the staging copy, so the next tb_slave_publish() carries it across.
+ * Cheap enough to call from the LoRa path directly: one byte store.
+ *
+ * CLAMP BEFORE CALLING. LoRa_getRSSI() returns -164 + RegPktRssiValue, so its
+ * range is -164..+91, and -164 narrowed to int8_t wraps to +92 -- a value that
+ * passes every plausibility test and displays as a very strong signal.
+ */
+void tb_slave_set_rssi(int8_t dbm);
+
+/*
  * Append one smoothed PPG sample, in raw MAX30102 counts, to the waveform ring
  * the ESP32 reads at TB_REG_PPG_BASE. Call once per sample at TB_PPG_FS_HZ,
  * from wherever the sample is produced -- two packs and two stores, no HAL, no
