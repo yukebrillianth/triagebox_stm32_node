@@ -66,7 +66,7 @@
 #define ECG_ADC_INDEX 0u
 #define MIC_ADC_INDEX 1u
 #define ANALOG_CHANNEL_COUNT 2u
-// ECG window: DSP_ECG_WINDOW samples at DSP_ADC_FS_HZ = 4s, enough for 4-6
+// ECG window: DSP_ECG_WINDOW samples at DSP_ADC_FS_HZ = 6.03s, enough for 4-6
 // beats and so 3-5 R-R intervals to take a median over.
 #define ECG_BUFFER_SIZE DSP_ECG_WINDOW
 // LoRa config.
@@ -146,7 +146,9 @@ max30102_t hmax30102;
 // Analog Sensor
 static volatile uint16_t analog_data[ANALOG_CHANNEL_COUNT];
 // ECG double buffer: the ADC ISR fills one half while the main loop processes
-// the other, so a 4s window can be analysed without blocking acquisition.
+// the other, so a 6.03s window can be analysed without blocking acquisition.
+// 3 buffers x DSP_ECG_WINDOW: these two banks at 2B/sample plus dsp_utils.c's
+// mon_ecg_filtered and ecg_energy at 4B each = 12B per sample, 36kB at 3000.
 static uint16_t ecg_buffer[2][ECG_BUFFER_SIZE];
 static volatile uint8_t ecg_fill_bank = 0;
 static volatile uint16_t ecg_buffer_index = 0;

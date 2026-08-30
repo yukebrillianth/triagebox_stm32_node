@@ -107,16 +107,33 @@ int main(void)
 	 * low end of what this can report is set by DSP_PR_WINDOW and not by
 	 * DSP_HR_MIN_BPM. Worth knowing before someone wonders why a bradycardic
 	 * patient reads 0. */
-	const float rates[] = { 50.0f, 60.0f, 75.0f, 100.0f, 150.0f, 200.0f };
+	const float rates[] = { 50.0f, 60.0f, 75.0f, 100.0f, 150.0f, 190.0f };
 	for (unsigned i = 0; i < sizeof(rates) / sizeof(rates[0]); ++i) {
 		Dsp_PrResult r = run(rates[i], 0.0f, 0.0f, 0);
 		printf("  %6.1f bpm -> %3u bpm, %u pulses, spread %.3f, regular %u\n",
 				rates[i], r.bpm, r.pulses, (double) r.spread, r.regular);
 		assert(r.regular == 1);
-		/* +-1 bpm: the interval is an integer number of 100Hz samples, so at
-		 * 200bpm one sample of quantisation is already 6.7bpm. */
+		/* +-7 bpm: the interval is an integer number of 100Hz samples, so at
+		 * 190bpm one sample of quantisation is already 6.2bpm. */
 		assert(fabsf((float) r.bpm - rates[i]) <= 7.0f);
 	}
+
+	/* ---- above DSP_HR_MAX_BPM the rate is refused, not reported ---------- */
+	/* 200bpm used to be the top of the sweep above and passed. It is now over
+	 * the ceiling, and the ceiling moved for a measured reason: above ~208bpm
+	 * the +-DSP_PR_SPREAD_FRAC window's lower edge falls inside the detector's
+	 * own refractory, so no interval can fail low and RateIsRegular() loses all
+	 * discriminating power. A lead-off ECG published 214 and 218bpm through
+	 * exactly that hole. Asserting the refusal here is what stops someone
+	 * "fixing" the sweep by raising the ceiling back.
+	 *
+	 * pulses stays populated: this is a real measurement of an implausible
+	 * rate, which the caller must be able to tell from no signal at all. */
+	Dsp_PrResult fast = run(210.0f, 0.0f, 0.0f, 0);
+	printf("  210.0 bpm -> %3u bpm, %u pulses, regular %u (over the ceiling)\n",
+			fast.bpm, fast.pulses, fast.regular);
+	assert(fast.bpm == 0);
+	assert(fast.pulses > 0);
 
 	/* ---- the dicrotic notch must not be counted ------------------------- */
 	/* 50% is the top of the physiological range for the notch. If this reports

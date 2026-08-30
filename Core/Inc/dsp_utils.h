@@ -15,14 +15,53 @@
 #include "arm_math.h"
 
 /* ---- Sample rates (Hz) -------------------------------------------------- */
-/* TIM2: 100MHz timer clock / (999+1) / (200+1) = 497.5Hz, both ADC ranks. */
+/* TIM2: 100MHz timer clock / (999+1) / (200+1) = 497.5Hz, both ADC ranks.
+ *
+ * Two constants for one rate, deliberately. This integer one sizes buffers and
+ * derives sample counts, where being 0.5% off is invisible and an integer keeps
+ * the arithmetic exact. Anything that converts a sample COUNT into a real-world
+ * RATE must use DSP_ADC_FS_TRUE_HZ instead, or the answer is 0.5% high. */
 #define DSP_ADC_FS_HZ 500u
+/*
+ * The rate the hardware actually produces: 100000000 / 1000 / 201 = 497.5124 Hz.
+ * Verified against the counter, 498.0-498.5 samples/s measured over SWD.
+ *
+ * Every published bpm read 0.50% high until 2026-08-30 because the bpm divide used
+ * the integer above -- a true 60.0 printed as 60.3. Small, but it is a measurement
+ * error with a known sign, and free to remove. Note that nothing ties either
+ * constant to the timer registers, so a prescaler change in the .ioc silently
+ * invalidates both; the derivation is spelled out here for that reason.
+ */
+#define DSP_ADC_FS_TRUE_HZ 497.5124f
 /* MAX30102 at sr_800 with smp_ave_8 averages down to ~100Hz output. */
 #define DSP_PPG_FS_HZ 100u
 
 /* ---- Window sizes ------------------------------------------------------- */
-/* 4s of ECG: 4-6 beats, so 3-5 R-R intervals to take a median over. */
-#define DSP_ECG_WINDOW 2000u
+/*
+ * 6.03s of ECG, up from the 4.02s (2000 samples) this was until 2026-08-30.
+ *
+ * 4s could not reach the bradycardia this device is supposed to triage. Three R-R
+ * intervals need four peaks inside the searchable span (the window less the
+ * DSP_ADC_FS_HZ/10 settle region), and at 4s that span is 3.920s -- so the
+ * arithmetic floor was 45.9 bpm, not the 30 that DSP_HR_MIN_BPM advertises, and
+ * acceptance was probabilistic well above it because the beat train's phase has to
+ * cooperate. Measured over 40 beat phases with a clean 200 LSB QRS: 40 bpm 0/40,
+ * 45 bpm 0/40, 50 bpm 11/40, 55 bpm 25/40, 60 bpm 38/40. A patient resting in the
+ * 50s got a blank screen more often than a reading.
+ *
+ * At 3000 samples the searchable span is 5.930s, three intervals fit down to
+ * 30.4 bpm, and the same sweep gives 40 bpm 97.2%, 45 bpm 100%, 50 bpm 100%.
+ * DSP_HR_MIN_BPM's 30 becomes honest for the first time.
+ *
+ * Cost is 12 bytes per sample -- ecg_buffer[2][] at 2B each plus mon_ecg_filtered
+ * and ecg_energy at 4B each -- so 24kB becomes 36kB of the F411's 128kB. Latency
+ * per reading goes 4.02s to 6.03s, which is the real price: it is 2s longer before
+ * a deteriorating patient's new rate appears. Overlapping windows would buy that
+ * back and were measured to do nothing for the rate floor (a window that cannot
+ * fit 4 peaks cannot fit them at any phase), so they are not worth their doubled
+ * false-positive exposure here.
+ */
+#define DSP_ECG_WINDOW 3000u
 /* Mic envelope is decimated to 10Hz; 256 pts = 25.6s, bin = 0.039Hz. */
 #define DSP_RESP_FFT_LEN 256u
 #define DSP_RESP_DECIM 50u
@@ -92,14 +131,49 @@
 /* Fraction of the systolic peak used as the detection threshold. The dicrotic
  * notch is the thing being excluded: it follows the systolic peak by 200-400ms
  * (inside a plausible interval, so the refractory alone will not reject it) and
- * reaches 20-50% of its height. 0.6 clears it with margin. Compare the ECG
- * path's 0.35 of a SQUARED envelope, which is 0.59 in amplitude terms - the
- * same place, reached differently. */
-#define DSP_PR_THRESH_FRAC 0.6f
+ * reaches 20-50% of its height. Compare the ECG path's 0.35 of a SQUARED
+ * envelope, which is 0.59 in amplitude terms - the same place, reached
+ * differently.
+ *
+ * 0.45, not the 0.6 this was until 2026-08-30, because 0.6 was rejecting real
+ * beats. The reference is the median of the four per-quarter maxima, i.e. a
+ * fraction of the LARGEST beat in the window, so beat-to-beat amplitude
+ * variation turns directly into missed beats: detection fails once the span
+ * exceeds 1/0.6 = 1.67x. Respiratory modulation alone is enough.
+ *
+ * Measured on a finger held in a 3D-printed housing, 61 samples over 75s: SpO2
+ * was rock steady (sd 0.27pp) off the SAME waveform while the pulse rate blanked
+ * on 23% of windows, with mon_pr_pulses down at 2-4 and mon_pr_spread at
+ * 0.97-1.88 -- spreads near 1.0 and 2.0 being one and two missed beats. Replayed
+ * offline at that operating point: 19% dropout at 0.6, 0% at 0.45, and the margin
+ * against notch detection extends to a 2.6x amplitude span.
+ *
+ * The floor is the notch, and it is close: tools/ppg_pr_selftest.c's 50%-notch
+ * case passes at 0.41 and fails at 0.40 (it reports 214 bpm from 10 pulses). 0.45
+ * leaves 10% margin over that break. Do not go lower without re-running it. */
+#define DSP_PR_THRESH_FRAC 0.45f
 
 /* ---- Plausibility limits ------------------------------------------------ */
 #define DSP_HR_MIN_BPM 30.0f
-#define DSP_HR_MAX_BPM 220.0f
+/*
+ * 200, not 220, and the reason is arithmetic rather than physiology.
+ *
+ * RateIsRegular() accepts an interval within +/-DSP_PR_SPREAD_FRAC of the median,
+ * and the peak search enforces a 200ms refractory (100 samples). For a short
+ * median the window's LOWER edge lands inside that dead time: 0.70 * median <=
+ * refractory+1 whenever median <= 144.3 samples, i.e. bpm >= 207.9. Above that
+ * rate no interval can fail low, so the regularity test is provably one-sided and
+ * has no discriminating power left.
+ *
+ * That is the hole the measured lead-off false positives came through -- 214 and
+ * 218 bpm published from an ECG clamp that was not attached to anything, while the
+ * PPG held 82-100. Over 449 lead-off intervals in that band, exactly zero fell
+ * below the window. Refusing above 200 costs 0% of real windows (the highest rate
+ * this device has ever measured is 150) and removes the one-sided hole.
+ *
+ * A rate this device cannot verify is one it should not report.
+ */
+#define DSP_HR_MAX_BPM 200.0f
 
 /*
  * Which of the two heart-rate sources to publish. Returns the rate, 0 if neither
