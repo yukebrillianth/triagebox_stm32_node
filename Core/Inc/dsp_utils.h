@@ -100,6 +100,52 @@
 /* ---- Plausibility limits ------------------------------------------------ */
 #define DSP_HR_MIN_BPM 30.0f
 #define DSP_HR_MAX_BPM 220.0f
+
+/*
+ * Which of the two heart-rate sources to publish. Returns the rate, 0 if neither
+ * has one; *from_ppg says which sensor won so the screen can stay traceable.
+ *
+ * NOT simply "prefer the ECG", because on its own the ECG cannot tell a heart
+ * from a disconnected electrode. Measured on this board with the ECG clamp not
+ * attached at all: consecutive windows published 214, 218, 136 and 55 bpm while
+ * the PPG -- a finger held in a 3D-printed housing -- sat at 82-100 with
+ * mon_pr_regular set throughout.
+ *
+ * Dsp_EcgProcessWindow()'s own gates cannot catch that, and the reason is worth
+ * stating plainly: MAINS HUM IS MORE REGULAR THAN A HEART. RateIsRegular() is the
+ * last line of defence there, and 50 Hz pickup on a floating electrode produces
+ * intervals that agree far better than real R-R intervals do -- so the regularity
+ * test prefers the artefact. DSP_HR_MAX_BPM's 220 leaves 214 and 218 inside the
+ * plausible band. Only a second sensor separates the two.
+ *
+ * 25% comes from both tails of the measurement: with the clamp ON the two methods
+ * agreed to within 3% across 30 consecutive windows (85/86, 93/92, 94/95), and
+ * every false positive above was more than 50% away. Integer, no divide.
+ *
+ * The PPG wins the disagreement rather than the ECG because its failures announce
+ * themselves -- DSP_PPG_MIN_DC drives mon_ppg_contact, so "no finger" is
+ * observable -- while the ECG has no lead-off input wired yet. See
+ * docs/hardware-change-request.md; once AD8232's LO reaches a GPIO this becomes a
+ * backstop instead of the only check.
+ */
+static inline uint16_t Dsp_PickRate(uint16_t ecg_bpm, uint16_t ppg_bpm,
+		uint8_t *from_ppg)
+{
+	if ((ecg_bpm > 0U) && (ppg_bpm > 0U)) {
+		uint16_t hi = (ecg_bpm > ppg_bpm) ? ecg_bpm : ppg_bpm;
+		uint16_t lo = (ecg_bpm > ppg_bpm) ? ppg_bpm : ecg_bpm;
+
+		if (((uint32_t) (hi - lo) * 4U) > (uint32_t) lo) {
+			ecg_bpm = 0U; /* distrust it; fall through to the PPG */
+		}
+	}
+	if (ecg_bpm > 0U) {
+		*from_ppg = 0U;
+		return ecg_bpm;
+	}
+	*from_ppg = (ppg_bpm > 0U) ? 1U : 0U;
+	return ppg_bpm;
+}
 #define DSP_RR_MIN_BRPM 6.0f
 /* Ceiling is set by triage need, not by adult resting range. This device is for
  * earthquake triage where patients may be adults or children: infants normally
