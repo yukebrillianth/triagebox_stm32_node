@@ -23,11 +23,132 @@ volatile uint32_t mon_i2c_recoveries = 0;
 /* How long the slave may look wedged before tb_slave_service() re-inits it.
  * Longer than the ESP32's 50 ms poll and than any single transaction (the
  * 132-byte PPG read is ~13 ms at 100 kHz), short enough that a jam clears
- * before the ESP32 finishes booting and gives up on the bus. */
-#define TB_SLAVE_STUCK_MS 1000U
+ * before the ESP32 finishes booting and gives up on the bus.
+ *
+ * 200 ms, not the 1000 ms this used to be, because 1000 ms loses the race it
+ * exists to win. The ESP32 reaches its GT911 read -- the first thing that dies
+ * on a held bus -- 1333 ms after its own reset, measured. A wedge that starts
+ * when the ESP32 resets mid-transfer therefore had 333 ms of margin, and the
+ * superloop can be delayed by the 497.5 Hz ADC ISR and by a LoRa transmit, so
+ * that margin was routinely gone. At 200 ms the bus is free ~1.1 s before the
+ * ESP32 looks at it. The floor is a whole transaction: 13 ms. */
+#define TB_SLAVE_STUCK_MS 200U
 
 /* Last tick at which the slave was armed and listening. */
 static uint32_t s_healthy_ms = 0;
+
+/* mon_i2c_reads + mon_i2c_writes as of the previous tb_slave_service() call.
+ * A completed transfer is the one piece of evidence no register can fake, and it
+ * is what keeps the watchdog from firing on sampling luck -- see the top of
+ * tb_slave_service(). */
+static uint32_t s_served_prev = 0;
+
+/*
+ * Are we holding a line low? Read straight from the pads -- IDR reflects the pin
+ * even while it is in alternate-function mode, so this costs two loads and
+ * disturbs nothing.
+ *
+ * BOTH lines are tested, and they mean different wedges:
+ *
+ *   SCL (PB10) low -- we are clock-stretching, stuck mid-transaction.
+ *   SDA (PB3)  low -- we are mid-byte with an ACK or a data bit on the wire. The
+ *                     slave drives SDA low during an ACK, and if the master is
+ *                     reset in that window it can come back with the bus looking
+ *                     busy and the slave parked exactly there. This case is not
+ *                     hypothetical: with the ESP32 side alive and its console
+ *                     silent, IDR read 0xF4D5 (SDA low, SCL high) and holding the
+ *                     STM32 in reset released it to 0x74D9.
+ *
+ * The earlier version of this checked SCL only, on the theory that SDA is the
+ * master's problem to clock out. The master cannot clock it out: the ESP32's
+ * own bus-recovery bails the moment it sees SCL low, so a wedged slave that
+ * stretches while ALSO sitting on SDA is never recovered by either side.
+ *
+ * Deliberately no port bit-bang here: in AF mode the pad is an input to the I2C
+ * peripheral's open-drain driver, so reading it cannot disturb the bus.
+ */
+static bool tb_slave_bus_released(void)
+{
+    return HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10) == GPIO_PIN_SET
+        && HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_3) == GPIO_PIN_SET;
+}
+
+/*
+ * Is the peripheral actually able to answer, as opposed to merely believing it
+ * is? PE must be set and the event interrupt must be enabled, because a slave
+ * with ACK on and ITEVTEN off is the worst of both: the hardware ACKs its
+ * address, then stretches SCL waiting for an ISR that can never run.
+ *
+ * This is not defensive programming, it is a measured failure. After ~50 s of
+ * healthy traffic the link stopped for good, and the register dump was:
+ *
+ *   CR1=0x0401  PE=1, ACK=1          -- enabled
+ *   OAR1=0x4084 address 0x42          -- correct
+ *   CR2=0x0032  ITEVTEN=0, ITERREN=0  -- DEAF
+ *   SR1=0x0100  BERR                  -- an error got us here
+ *
+ * while HAL_I2C_GetState() still said LISTEN and mon_i2c_recoveries stayed
+ * frozen. The HAL's I2C_ITError() disables EVT/BUF/ERR interrupts, and the
+ * re-arm in HAL_I2C_ErrorCallback can fail without changing State, so State is
+ * not evidence. CR2 is.
+ */
+static bool tb_slave_armed_in_hw(void)
+{
+    return (hi2c2.Instance->CR1 & I2C_CR1_PE) != 0U
+        && (hi2c2.Instance->CR2 & I2C_CR2_ITEVTEN) != 0U;
+}
+
+/*
+ * Is SR2's BUSY flag latched on? THIS IS THE ONE THAT ACTUALLY KILLS THE LINK,
+ * and every test above is blind to it.
+ *
+ * Measured with the ESP32 polling at 20 Hz: 21 reads/s for 22 s, then reads stop
+ * dead and never resume, while the slave looks perfect --
+ *
+ *   CR1=0x0401  PE=1, ACK=1             enabled
+ *   CR2=0x0332  ITEVTEN=1               armed
+ *   SR1=0x0000  no error at all
+ *   IDR         both lines high         bus released
+ *   SR2=0x0002  BUSY                    <-- the only bit that moved
+ *
+ * BUSY set means the peripheral saw a START and never the matching STOP, so it
+ * will not recognise the next one. It stops answering silently: no error flag, no
+ * state change, nothing to find it by. HAL_I2C_GetState() reads LISTEN the whole
+ * time, which is exactly why the state test refreshed s_healthy_ms forever and
+ * the watchdog never fired -- `stuck` stayed under 10 ms for the 27 s the link
+ * was dead. The cure is confirmed as well: forcing PE=0 made the recovery below
+ * run, and BUSY went 0x0002 -> 0x0000.
+ *
+ * BUSY is also set legitimately on every transaction, ours and every other
+ * master's on this shared bus, which is why it can only count as a fault when it
+ * lasts TB_SLAVE_STUCK_MS with not one completed transfer in that whole window.
+ */
+static bool tb_slave_busy_latched(void)
+{
+    return (hi2c2.Instance->SR2 & I2C_SR2_BUSY) != 0U;
+}
+
+/*
+ * Both lines on the floor at once is NOT our wedge, and recovering on it is
+ * actively harmful.
+ *
+ * A stretching slave holds SCL and leaves SDA to the pull-up; a slave caught
+ * mid-ACK holds SDA while the master drives SCL. One line, never both. Both low
+ * means nothing is pulling the bus up at all -- the ESP32 board is unpowered, and
+ * its 3V3 rail is where the pull-ups live -- and re-initialising I2C2 cannot
+ * conjure a pull-up.
+ *
+ * Measured: with the ESP32 board off, IDR read both pins low and this test's
+ * absence cost 2662 recoveries in 600 s, 4.4 every single second. Each one is a
+ * DeInit/Init that drops PB10/PB3 to analog on the way through, so if the master
+ * IS alive and mid-transfer, the slave vanishes off the bus in the middle of a
+ * byte. That is a fault this function invents rather than fixes.
+ */
+static bool tb_slave_bus_dead(void)
+{
+    return HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10) == GPIO_PIN_RESET
+        && HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_3) == GPIO_PIN_RESET;
+}
 
 /*
  * Double buffer. The superloop fills s_stage; the ISR only ever touches
@@ -82,6 +203,34 @@ static void arm_receive(void)
                                       I2C_NEXT_FRAME);
 }
 
+/*
+ * Swap the analog noise filter for the digital one. THIS IS THE FIX FOR THE
+ * LATCHED BUSY FLAG, not a tuning knob -- call it after every HAL_I2C_Init().
+ *
+ * F411 erratum 2.8.7, "I2C analog filter may provide wrong value, locking BUSY
+ * flag": a glitch on SDA or SCL can make the analog filter hand the state machine
+ * a wrong level, and SR2.BUSY then latches set with no way to clear it from
+ * software. ST's own workaround is a software reset of the peripheral; the erratum
+ * also notes the analog filter is what produces the wrong value.
+ *
+ * Which matches what this bus does, measured: BUSY set with SR1 clean, both pads
+ * released, the slave silently refusing to answer, and it survived 394
+ * DeInit/Init recoveries and a CR1.SWRST -- 75 s with the link down and not one
+ * transfer completing. ANOFF removes the mechanism instead of cleaning up after
+ * it, and DNF=1 keeps a filter: one I2C clock period of digital debounce, which
+ * on this 100 kHz link is 20 ns of spike rejection and is not subject to the
+ * erratum.
+ *
+ * FLTR is writable only with PE=0 (RM0383 18.6.9), and HAL_I2C_Init() leaves PE
+ * set, so the enable has to be bracketed here rather than folded into MspInit.
+ */
+static void tb_slave_use_digital_filter(void)
+{
+    __HAL_I2C_DISABLE(&hi2c2);
+    hi2c2.Instance->FLTR = I2C_FLTR_ANOFF | 1U;
+    __HAL_I2C_ENABLE(&hi2c2);
+}
+
 void tb_slave_init(void)
 {
     memset(&s_stage, 0, sizeof(s_stage));
@@ -112,6 +261,7 @@ void tb_slave_init(void)
     if (HAL_I2C_Init(&hi2c2) != HAL_OK) {
         Error_Handler();
     }
+    tb_slave_use_digital_filter();
 
     /*
      * NVIC needs no code here: I2C2's global interrupt is ticked in the .ioc, so
@@ -135,29 +285,41 @@ void tb_slave_init(void)
 /*
  * Watchdog for a wedged slave. Call from the superloop.
  *
- * Healthy means one exact thing: HAL state LISTEN -- armed, between
- * transactions. Anything else that PERSISTS for TB_SLAVE_STUCK_MS is a wedge:
- * stuck mid-transfer (BUSY_TX_LISTEN / BUSY_RX_LISTEN) while holding SCL low, or
- * listening lost entirely (READY) because a re-arm failed on an error path.
- * Recovery is DeInit/Init/EnableListen; MspDeInit puts PB10/PB3 back to analog,
- * which releases both lines. The published snapshot is untouched.
+ * Healthy means all four together: HAL state LISTEN -- armed, between
+ * transactions -- AND the event interrupt actually enabled AND both bus lines
+ * released AND SR2's BUSY flag clear. Anything else that PERSISTS for
+ * TB_SLAVE_STUCK_MS with no transfer completing is a wedge: stuck mid-transfer
+ * (BUSY_TX_LISTEN / BUSY_RX_LISTEN), listening lost entirely (READY) because a
+ * re-arm failed on an error path, armed-but-still-sitting-on-a-line, or armed and
+ * idle and silently deaf with BUSY latched (below). Recovery resets the
+ * peripheral and re-arms; MspDeInit puts PB10/PB3 back to analog, which releases
+ * both lines. The published snapshot is untouched.
  *
  * This matters because I2C2's pins are the ESP32's ONLY I2C bus, shared with the
- * GT911 touch controller, the TCA9554 display expander and the SW6106 PMIC. A
- * slave holding SCL takes all three down, and it shows up as a white panel with
- * no UI -- nothing on the ESP32 side can clear it.
+ * GT911 touch controller, the TCA9554 display expander and the SW6106 PMIC. One
+ * wedged slave takes all three down. On SCL it shows up as a white panel that
+ * never finishes booting; on SDA the ESP32 boots fine and then dies a few seconds
+ * later in a storm of "I2C bus is still busy but software timeout detected",
+ * because a START needs SDA to fall and it is already on the floor.
  *
- * WHAT THIS CANNOT SEE, so never read mon_i2c_recoveries == 0 as "the bus is
- * fine": a transmit under-run, where the master clocks past the armed length.
- * I2C_SlaveTransmit_TXE() sets State back to LISTEN as soon as the last armed
- * byte reaches DR, so the wedge looks armed and idle and this function refreshes
- * s_healthy_ms every pass while SCL is on the floor. There is no state to test
- * for. The only defence is to keep the master's read length equal to the block
- * length; see HAL_I2C_AddrCallback.
+ * WHY THE PADS ARE TESTED AND NOT JUST THE STATE. On a transmit under-run -- the
+ * master clocks past the armed length, or vanishes in the window just after the
+ * last armed byte reaches DR -- I2C_SlaveTransmit_TXE() has already set State
+ * back to LISTEN. The wedge then looks armed and idle while a line is held down,
+ * so testing the state alone refreshes s_healthy_ms on every pass and recovers
+ * nothing. Measured: mon_i2c_recoveries sat at 6 while only 14% of the ESP32's
+ * polls were completing, s_healthy_ms tracked uwTick the whole time, and IDR read
+ * SDA low / SCL high for as long as it was sampled. Holding the STM32 in reset
+ * released SDA, which is what proves the line was ours.
  *
- * SR2's BUSY flag is deliberately NOT part of the test: it tracks the bus rather
- * than us, so it sets when the ESP32 talks to the touch controller, and testing
- * it would re-init a perfectly healthy slave because of someone else's traffic.
+ * SR2's BUSY flag IS part of the test, and getting there took two wrong turns.
+ * It tracks the bus rather than us, so it sets whenever the ESP32 talks to the
+ * touch controller -- testing it naively re-inits a healthy slave because of
+ * someone else's traffic. But BUSY latched with no STOP is also the ONE failure
+ * that actually took the link down in practice, and nothing else in the register
+ * file shows it. Both are true, so the resolution is not to drop the test but to
+ * require it to LAST: see the completed-transfer gate at the top of the function.
+ * The pads have the same exposure and the same answer.
  *
  * ponytail: only fixes the case where WE hold the bus. If the ESP32 side holds a
  * line low the STM32 cannot clear it -- that needs the nine-clock master recovery
@@ -167,8 +329,34 @@ void tb_slave_init(void)
 void tb_slave_service(void)
 {
     uint32_t now = HAL_GetTick();
+    uint32_t served = mon_i2c_reads + mon_i2c_writes;
 
-    if (HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_LISTEN) {
+    /*
+     * A transfer completed since the last call, so whatever the registers say
+     * right now, this slave is answering the master. This gate is what lets the
+     * tests above be strict without being trigger-happy: every one of them --
+     * state, ITEVTEN, the pads, BUSY -- reads "faulty" for a few microseconds
+     * during any normal transaction, and the poll task runs 20 of those a second.
+     * Sampling luck used to be the difference between a healthy board and 4.4
+     * destructive re-inits per second.
+     */
+    if (served != s_served_prev) {
+        s_served_prev = served;
+        s_healthy_ms = now;
+        return;
+    }
+
+    /* Nobody is pulling the bus up: not our fault and not ours to fix. Keep the
+     * clock running so a wedge is not measured across the ESP32's downtime. */
+    if (tb_slave_bus_dead()) {
+        s_healthy_ms = now;
+        return;
+    }
+
+    if ((HAL_I2C_GetState(&hi2c2) == HAL_I2C_STATE_LISTEN)
+        && tb_slave_armed_in_hw()
+        && tb_slave_bus_released()
+        && !tb_slave_busy_latched()) {
         s_healthy_ms = now;
         return;
     }
@@ -178,6 +366,26 @@ void tb_slave_service(void)
 
     ++mon_i2c_recoveries;
     s_healthy_ms = now;
+
+    /*
+     * SWRST first, and DeInit alone is NOT enough -- this is the difference
+     * between a recovery that logs and a recovery that works.
+     *
+     * Measured: with only the DeInit/Init pair below, a latched SR2.BUSY survived
+     * 394 consecutive recoveries over 75 s and the link never came back. The
+     * reason is timing, not thoroughness: the ESP32 retries every ~150 ms, so
+     * HAL_I2C_Init() re-enables a fresh peripheral straight into somebody else's
+     * in-flight transaction, and it latches BUSY again on the START it was never
+     * present for. DeInit clears PE, which releases the pads, but PE alone does
+     * not reset the state machine that owns BUSY.
+     *
+     * SWRST does: RM0383 says the peripheral is held under reset while the bit is
+     * set, which clears BUSY and releases SCL and SDA. It is also the only way out
+     * of the stuck-BUSY condition ST documents. Two writes, no delay loop needed --
+     * the bus is APB1 and the write has landed before the next instruction reads it.
+     */
+    hi2c2.Instance->CR1 |= I2C_CR1_SWRST;
+    hi2c2.Instance->CR1 &= ~I2C_CR1_SWRST;
 
     HAL_I2C_DeInit(&hi2c2);
     s_ptr = 0U;
@@ -190,6 +398,7 @@ void tb_slave_service(void)
         __HAL_I2C_DISABLE(&hi2c2);
         return;
     }
+    tb_slave_use_digital_filter();
     if (HAL_I2C_EnableListen_IT(&hi2c2) != HAL_OK) {
         __HAL_I2C_DISABLE(&hi2c2);
     }
@@ -404,7 +613,31 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
         ++mon_i2c_errors;
     }
 
-    /* Listening always has to be re-armed after any error, AF included, or the
-     * slave silently stops answering after the first read. */
+    /*
+     * Re-arm, and the state has to be forced first or the re-arm is a no-op.
+     * THIS IS THE BUG THAT KILLED THE LINK EVERY TIME, and it is two lines of
+     * HAL contract nobody reads:
+     *
+     *   I2C_ITError()            -- hi2c->State = HAL_I2C_STATE_LISTEN  (a slave
+     *                               that was listening is put back in LISTEN)
+     *   HAL_I2C_EnableListen_IT() -- returns HAL_BUSY unless State is READY, and
+     *                               touches nothing on the way out
+     *
+     * So after any error that goes through I2C_ITError -- a BERR, an overrun, a
+     * misplaced START from noise -- EVT and ERR interrupts are off, State says
+     * LISTEN, and every re-arm from here silently fails. The slave then ACKs its
+     * address in hardware and stretches SCL forever waiting for an ISR that is
+     * disabled. On the shared display bus that takes the GT911 down with it, and
+     * the panel freezes.
+     *
+     * Measured, before this: the link ran 6-28 s from boot, then stopped for good
+     * with CR2=0x0032 (ITEVTEN=0, ITERREN=0) while HAL_I2C_GetState() still
+     * reported LISTEN. AF is exempt because the HAL routes acknowledge-failure
+     * through I2C_Slave_AF() and ListenCpltCallback instead, which is why reads
+     * kept working right up to the first real error.
+     */
+    if (hi2c->State == HAL_I2C_STATE_LISTEN) {
+        hi2c->State = HAL_I2C_STATE_READY;
+    }
     (void)HAL_I2C_EnableListen_IT(hi2c);
 }

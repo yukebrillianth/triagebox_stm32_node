@@ -77,13 +77,19 @@ static void test_layout(void)
      * validity test is a range and not `!= SENTINEL`:
      *   0x00  this node has not heard a poll yet (polls are 15 s apart)
      *   0xFF  the AddrCallback pad, i.e. an old STM32 or an address it refuses
-     * Both are above the strongest real signal, so the upper bound rejects both.
+     * They are adjacent, so one upper bound at -2 rejects both.
      */
     assert(!tb_rssi_valid(0));
     assert(!tb_rssi_valid((int8_t)0xFFU));
     assert(tb_rssi_valid(-123)); /* SF7/125k sensitivity, about the weakest real */
     assert(tb_rssi_valid(TB_RSSI_MAX_DBM));
     assert(!tb_rssi_valid(TB_RSSI_MAX_DBM + 1));
+
+    /* Regression: -12 dBm is what this radio reports with an antenna fitted and
+     * the station a couple of metres away, measured over SWD. The bound used to
+     * be -20 on a saturation theory, so a real reading was discarded and the
+     * ESP32 showed "LoRa siap" on a healthy link. */
+    assert(tb_rssi_valid(-12));
 
     /* Read and write blocks must not overlap; the slave enforces read-only on
      * everything outside the write block by switching on the pointer. */
@@ -730,6 +736,69 @@ static void test_buttons_null_safe(void)
     tb_buttons_init(NULL);
 }
 
+/*
+ * Dsp_PickRate(): which heart-rate source reaches the wire.
+ *
+ * Worth a host test rather than hardware: the case that matters is the ECG
+ * publishing a plausible-but-wrong rate from a disconnected electrode, and
+ * reproducing that on the bench means deliberately leaving the clamp off and
+ * waiting for the artefact to land inside 30-220 bpm.
+ */
+static void test_pick_rate(void)
+{
+    uint8_t from_ppg = 0xAAU;
+
+    /* Neither source: nothing to publish, and not attributed to the PPG. */
+    assert(Dsp_PickRate(0U, 0U, &from_ppg) == 0U);
+    assert(from_ppg == 0U);
+
+    /* One source only: it wins, whatever it is. */
+    assert(Dsp_PickRate(72U, 0U, &from_ppg) == 72U);
+    assert(from_ppg == 0U); /* ECG */
+    assert(Dsp_PickRate(0U, 68U, &from_ppg) == 68U);
+    assert(from_ppg == 1U); /* PPG */
+
+    /* Both, agreeing: the ECG wins, because a real R wave beats a pulse wave
+     * for timing and it is the sensor the triage protocol expects. These are
+     * the measured pairs from 30 consecutive windows with the clamp on. */
+    assert(Dsp_PickRate(85U, 86U, &from_ppg) == 85U);
+    assert(from_ppg == 0U);
+    assert(Dsp_PickRate(93U, 92U, &from_ppg) == 93U);
+    assert(from_ppg == 0U);
+    assert(Dsp_PickRate(94U, 95U, &from_ppg) == 94U);
+    assert(from_ppg == 0U);
+
+    /* Both, disagreeing: the measured lead-off artefacts. Each one must lose to
+     * the PPG rather than be published as tachycardia. */
+    assert(Dsp_PickRate(214U, 85U, &from_ppg) == 85U);
+    assert(from_ppg == 1U);
+    assert(Dsp_PickRate(218U, 82U, &from_ppg) == 82U);
+    assert(from_ppg == 1U);
+    assert(Dsp_PickRate(136U, 90U, &from_ppg) == 90U);
+    assert(from_ppg == 1U);
+    assert(Dsp_PickRate(55U, 91U, &from_ppg) == 91U);
+    assert(from_ppg == 1U);
+
+    /* The boundary, both directions. 25% of 80 is 20, so 100 is exactly at the
+     * limit and must still be trusted; 101 is over and must not be. Asserting
+     * both sides is the point -- an off-by-one here silently changes which
+     * sensor the device believes. */
+    assert(Dsp_PickRate(100U, 80U, &from_ppg) == 100U);
+    assert(from_ppg == 0U);
+    assert(Dsp_PickRate(101U, 80U, &from_ppg) == 80U);
+    assert(from_ppg == 1U);
+    /* Symmetric: a low ECG against a high PPG is rejected on the same margin. */
+    assert(Dsp_PickRate(80U, 100U, &from_ppg) == 80U);
+    assert(from_ppg == 0U);
+    assert(Dsp_PickRate(80U, 101U, &from_ppg) == 101U);
+    assert(from_ppg == 1U);
+
+    /* Extremes stay inside uint16 arithmetic: DSP_HR_MAX_BPM against
+     * DSP_HR_MIN_BPM is a 633% disagreement and must not wrap. */
+    assert(Dsp_PickRate(220U, 30U, &from_ppg) == 30U);
+    assert(from_ppg == 1U);
+}
+
 int main(void)
 {
     test_layout();
@@ -749,6 +818,7 @@ int main(void)
     test_buttons_independent();
     test_buttons_ignore_high_bits();
     test_buttons_null_safe();
+    test_pick_rate();
 
     printf("tb_link_selftest: all checks passed\n");
     return 0;

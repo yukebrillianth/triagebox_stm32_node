@@ -237,6 +237,11 @@ volatile uint8_t mon_pr_agree = 0;
  * traceable to a sensor. */
 volatile uint16_t mon_rate_bpm = 0;
 volatile uint8_t mon_rate_is_pr = 0;
+/* How many times the two rate sources disagreed by more than 25% and the ECG was
+ * dropped. Climbing while a finger is on the sensor means the ECG electrodes are
+ * off or noisy -- the closest thing to a lead-off indicator until AD8232's LO pin
+ * reaches a GPIO. See the cross-check in the superloop. */
+volatile uint32_t mon_rate_disagreements = 0;
 
 /* Respiratory rate, updated every 2.5s once the 25.6s window has filled. */
 volatile float mon_resp_brpm = 0.0f; /**< breaths/min, 0 = no reading */
@@ -639,13 +644,22 @@ int main(void)
 		/* The rate the rest of the system sees. Recomputed every pass, not
 		 * inside either producer's block, so neither source can stall the
 		 * other's updates: if the MAX30102 stops answering, PPG blocks stop
-		 * completing, and a fresh ECG rate must still reach the wire. */
-		if (mon_hr_bpm > 0U) {
-			mon_rate_bpm = mon_hr_bpm;
-			mon_rate_is_pr = 0;
-		} else {
-			mon_rate_bpm = mon_pr_bpm;
-			mon_rate_is_pr = (mon_pr_bpm > 0U) ? 1U : 0U;
+		 * completing, and a fresh ECG rate must still reach the wire.
+		 *
+		 * The choice itself lives in Dsp_PickRate() so it is host-tested -- see
+		 * tools/tb_link_selftest.c. It is not "prefer the ECG": read the comment
+		 * there before changing the 25% window, it is measured, not guessed. */
+		{
+			uint8_t from_ppg = 0U;
+
+			mon_rate_bpm = Dsp_PickRate(mon_hr_bpm, mon_pr_bpm, &from_ppg);
+			mon_rate_is_pr = from_ppg;
+
+			/* The ECG had a rate and still lost, so the two sensors disagreed.
+			 * The closest thing to a lead-off indicator this board has. */
+			if ((mon_hr_bpm > 0U) && (from_ppg != 0U)) {
+				++mon_rate_disagreements;
+			}
 		}
 
 		/* ---- LoRa: answer the station if it asked ---- */
@@ -918,8 +932,42 @@ void max30102_plot(uint32_t ir_sample, uint32_t red_sample) {
  * for the ESP32 and once for the radio -- and the two could drift apart with no
  * symptom on either link. The only per-link difference left is respiratory rate,
  * which the I2C map carries in tenths and the MQTT vital wants whole. */
+/* Respiratory rate is OFF at the source until the microphone physically exists.
+ * Set to 1 when the PCB carrying the 3.5 mm mic jack is built, then calibrate the
+ * signal-strength gate this replaces (see below).
+ *
+ * PA2 is an unconnected pin today and the respiratory path cannot tell. Measured
+ * with no mic fitted: the FFT's five strongest peaks came back 16.8, 16.0, 14.2,
+ * 10.5 and 9.7 -- the "strongest" component is 1.05x the runner-up, which is
+ * exactly what a flat noise floor looks like -- and mon_resp_peak_ratio only
+ * reached 2.76-3.23. Yet mon_resp_brpm published 12-13 brpm on some windows and
+ * lit both TB_FLAG_RR_VALID and TB_SENSOR_MIC.
+ *
+ * A peak-prominence gate is the eventual fix, and it is deliberately NOT here yet:
+ * the reject side is measurable (noise stays under 3.3) but the accept side is not,
+ * because there is no mic to breathe into. A guessed threshold set too high would
+ * leave RR permanently silent once the mic arrives, with nothing to point at.
+ *
+ * Off rather than gated, because of what this number means to whoever reads it.
+ * 13 brpm reads as normal respiration on a casualty who may not be breathing at
+ * all. A blank column is a visible failure an operator retries; a plausible wrong
+ * number is not. The DSP keeps running either way, so mon_resp_* stays available
+ * over SWD for the calibration session. */
+#define MON_RESP_MIC_FITTED 0
+
+/* Respiratory rate as it goes on both wires: the measurement when a mic exists,
+ * a hard 0 ("no reading", per tb_regs.h) when one does not. One accessor so the
+ * I2C block and the LoRa packet cannot disagree. */
+static float ResolvedRespBrpm(void) {
+#if MON_RESP_MIC_FITTED
+	return mon_resp_brpm;
+#else
+	return 0.0f;
+#endif
+}
+
 static void PackTelemetry(void) {
-	float brpm = mon_resp_brpm;
+	float brpm = ResolvedRespBrpm();
 	float spo2 = mon_spo2_pct;
 	uint8_t len = rfid_ascii_len;
 
@@ -1263,16 +1311,23 @@ static void PublishToEsp32(void) {
 
 	/* Per-vital validity. A zero reading means "no reading" in every one of
 	 * these, which is why each gets its own bit: a finger off the MAX30102
-	 * must not invalidate a perfectly good ECG heart rate. */
-	if (mon_hr_bpm > 0U) {
+	 * must not invalidate a perfectly good ECG heart rate.
+	 *
+	 * Driven from mon_rate_bpm/mon_rate_is_pr rather than re-deciding from
+	 * mon_hr_bpm here. The arbitration in the superloop can drop an ECG rate
+	 * that disagrees with the PPG, and a second copy of the rule would light
+	 * TB_SENSOR_ECG for a rate that never reached the wire. */
+	if (mon_rate_bpm > 0U) {
 		flags |= TB_FLAG_HR_VALID;
-		sensors |= TB_SENSOR_ECG;
-	} else if (mon_pr_bpm > 0U) {
-		/* A pulse rate is a valid rate, so TB_FLAG_HR_VALID is set and the
-		 * number is published -- but TB_SENSOR_ECG is NOT, because the ECG did
-		 * not produce it and a status dot claiming a working ECG would send
-		 * someone looking for a fault that is already known. */
-		flags |= TB_FLAG_HR_VALID | TB_FLAG_HR_FROM_PPG;
+		if (mon_rate_is_pr != 0U) {
+			/* A pulse rate is a valid rate, so the number is published -- but
+			 * TB_SENSOR_ECG is NOT, because the ECG did not produce it and a
+			 * status dot claiming a working ECG would send someone looking for
+			 * a fault that is already known. */
+			flags |= TB_FLAG_HR_FROM_PPG;
+		} else {
+			sensors |= TB_SENSOR_ECG;
+		}
 	}
 	if (mon_spo2_valid != 0U) {
 		flags |= TB_FLAG_SPO2_VALID;
@@ -1293,7 +1348,7 @@ static void PublishToEsp32(void) {
 	if (mon_red_raw > 0U) {
 		sensors |= TB_SENSOR_MAX30102;
 	}
-	if (mon_resp_brpm > 0.0f) {
+	if (ResolvedRespBrpm() > 0.0f) {
 		flags |= TB_FLAG_RR_VALID;
 		sensors |= TB_SENSOR_MIC;
 	}
@@ -1321,7 +1376,7 @@ static void PublishToEsp32(void) {
 
 	tb_slave_publish(flags, mon_buttons, mon_rate_bpm,
 			(uint16_t) (mon_spo2_pct + 0.5f),
-			(uint16_t) ((mon_resp_brpm * 10.0f) + 0.5f),
+			(uint16_t) ((ResolvedRespBrpm() * 10.0f) + 0.5f),
 			0U, /* bp_sys: no source yet */
 			0U, /* bp_dia: no source yet */
 			/* Echoed back rather than left at 0xFF: TB_REG_BATTERY is "the
