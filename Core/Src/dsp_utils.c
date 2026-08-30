@@ -12,7 +12,6 @@
  */
 
 #include "dsp_utils.h"
-#include <math.h>
 #include <string.h>
 
 /* ---- Filter coefficients ------------------------------------------------ */
