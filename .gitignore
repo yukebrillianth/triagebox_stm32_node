@@ -3,6 +3,10 @@
 /Debug/
 /Release/
 
+# Same, for the Makefile build. Separate directory on purpose: CubeIDE owns
+# Debug/ and would not know what to do with objects laid out by make.
+/build/
+
 # CubeIDE indexer / local workspace state (per-machine, not per-project).
 .settings/
 *.launch
