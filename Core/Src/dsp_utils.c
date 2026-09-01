@@ -335,7 +335,7 @@ void Dsp_EcgProcessWindow(const uint16_t *raw, uint32_t len, Dsp_EcgResult *out)
 		return;
 	}
 
-	float32_t bpm = (60.0f * (float32_t) DSP_ADC_FS_HZ) / median_samples;
+	float32_t bpm = (60.0f * DSP_ADC_FS_TRUE_HZ) / median_samples;
 	if (bpm < DSP_HR_MIN_BPM || bpm > DSP_HR_MAX_BPM) {
 		return;
 	}
@@ -779,6 +779,29 @@ void Dsp_Spo2Compute(Dsp_Spo2Result *out)
 	/* Empirical Beer-Lambert approximation used by most MAX3010x reference
 	 * code. Uncalibrated: treat as a trend, not a clinical reading. */
 	float32_t spo2 = 110.0f - (25.0f * r);
+
+	/*
+	 * Say when the answer came from the ends of the fit rather than its middle,
+	 * because on this hardware it usually does and the number looks no different.
+	 *
+	 * The clamp below bites at exactly r = 0.4000: r 0.40 -> 0.44 maps to
+	 * 100.0 -> 99.0. Measured over 75s on a finger in a 3D-printed housing, r
+	 * stayed inside 0.40-0.44 the whole time and the reported SpO2 never left
+	 * 99.1-100.0 -- so the entire recording lived in that sliver with its top
+	 * pinned by the clamp, which is where the sd of 0.27pp comes from. Reading 97%
+	 * under this fit would need r = 0.520.
+	 *
+	 * r is not wrong for being 0.42; this curve was derived for 660/940nm
+	 * transmission probes and this is a 660/880nm reflectance part, whose DC ratio
+	 * enters r multiplicatively. Retuning 110-25r to force a nicer number without a
+	 * reference oximeter would move the reading, not measure it -- a curve fitted
+	 * at one point on one finger reports that value for everyone. So the honest
+	 * change is to flag the saturation, not to hide it.
+	 *
+	 * 1.6 at the other end is where the fit reaches its 70% floor.
+	 */
+	out->extrapolated = (r < 0.40f || r > 1.6f) ? 1U : 0U;
+
 	if (spo2 > 100.0f) {
 		spo2 = 100.0f;
 	}

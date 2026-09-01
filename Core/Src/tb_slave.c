@@ -624,11 +624,10 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
      *                               touches nothing on the way out
      *
      * So after any error that goes through I2C_ITError -- a BERR, an overrun, a
-     * misplaced START from noise -- EVT and ERR interrupts are off, State says
-     * LISTEN, and every re-arm from here silently fails. The slave then ACKs its
-     * address in hardware and stretches SCL forever waiting for an ISR that is
-     * disabled. On the shared display bus that takes the GT911 down with it, and
-     * the panel freezes.
+     * misplaced START from noise -- State says LISTEN and every re-arm from
+     * here silently fails. The slave then ACKs its address in hardware and
+     * stretches SCL forever waiting for an ISR that is disabled. On the shared
+     * display bus that takes the GT911 down with it, and the panel freezes.
      *
      * Measured, before this: the link ran 6-28 s from boot, then stopped for good
      * with CR2=0x0032 (ITEVTEN=0, ITERREN=0) while HAL_I2C_GetState() still
@@ -640,4 +639,16 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
         hi2c->State = HAL_I2C_STATE_READY;
     }
     (void)HAL_I2C_EnableListen_IT(hi2c);
+
+    /*
+     * I2C_ITError() re-disables EVT|BUF|ERR AFTER this callback returns unless
+     * ErrorCode is clean -- the tail of stm32f4xx_hal_i2c.c's I2C_ITError
+     * checks it against BERR|ARLO|AF|OVR and disables the interrupts, and only
+     * the AF branch then re-arms via ListenCpltCallback. So a BERR/ARLO/OVR
+     * would undo the re-arm above the instant we return: interrupts off, state
+     * LISTEN, ACK still set, SCL stretched until the watchdog. Clearing the
+     * error here makes the tail skip both blocks; the captured `err` above is
+     * what we count, so nothing is lost.
+     */
+    hi2c->ErrorCode = HAL_I2C_ERROR_NONE;
 }
