@@ -19,10 +19,11 @@ volatile uint32_t mon_i2c_reads = 0;
 volatile uint32_t mon_i2c_writes = 0;
 volatile uint32_t mon_i2c_errors = 0;
 volatile uint32_t mon_i2c_recoveries = 0;
+volatile uint32_t mon_bp_writes_rejected = 0;
 
 /* How long the slave may look wedged before tb_slave_service() re-inits it.
  * Longer than the ESP32's 50 ms poll and than any single transaction (the
- * 132-byte PPG read is ~13 ms at 100 kHz), short enough that a jam clears
+ * 124-byte waveform read is ~11 ms at 100 kHz), short enough that a jam clears
  * before the ESP32 finishes booting and gives up on the bus.
  *
  * 200 ms, not the 1000 ms this used to be, because 1000 ms loses the race it
@@ -167,16 +168,16 @@ static volatile tb_snapshot_t s_live;
 static uint8_t s_tx[sizeof(tb_snapshot_t)];
 
 /*
- * PPG waveform ring, written by tb_slave_ppg_push() and latched into s_ppg_tx
- * the same way s_live is. It needs the latch for the same reason: a 132-byte
- * read takes ~12ms at 100kHz, which is long enough for a new sample to land on
- * the slot the master is part-way through reading.
+ * Waveform ring (IR + RED + ECG), written by tb_slave_wave_push() and latched
+ * into s_wave_tx the same way s_live is. It needs the latch for the same reason:
+ * a 124-byte read takes ~11ms at 100kHz, which is long enough for a new sample
+ * to land on the slot the master is part-way through reading.
  *
  * volatile is doing real work here, not decoration -- see the store order in
- * tb_slave_ppg_push().
+ * tb_wave_push().
  */
-static volatile tb_ppg_block_t s_ppg;
-static uint8_t s_ppg_tx[sizeof(tb_ppg_block_t)];
+static volatile tb_wave_block_t s_wave;
+static uint8_t s_wave_tx[sizeof(tb_wave_block_t)];
 
 static volatile uint8_t s_ptr;         /* register pointer, auto-increments */
 static volatile bool s_ptr_valid;      /* false until the master writes one */
@@ -186,6 +187,22 @@ static volatile uint8_t s_cmd = TB_CMD_NONE;
 static volatile uint8_t s_priority;
 static volatile uint8_t s_confidence;
 static volatile bool s_result_fresh = false;
+
+/*
+ * The ESP32's ML blood-pressure prediction, in mmHg, and whether it is new.
+ *
+ * Two pairs, deliberately. s_bp_wr_* is the half-assembled write -- four bytes
+ * arrive one interrupt at a time, so there is an instant where sys is from this
+ * model run and dia is from the last one -- and s_bp_* is what a reader may
+ * believe: a pair that arrived complete and passed tb_bp_pair_valid(). Latching
+ * in place would publish exactly the mismatch the two-stage copy exists to
+ * prevent. See TB_REG_HOST_BP_SYS for why DIA's last byte is the commit point.
+ */
+static volatile uint16_t s_bp_wr_sys;
+static volatile uint16_t s_bp_wr_dia;
+static volatile uint16_t s_bp_sys;
+static volatile uint16_t s_bp_dia;
+static volatile bool s_bp_fresh = false;
 
 /* The ESP32's fuel-gauge reading, which this board cannot take itself. 0xFF
  * until it writes one, and 0xFF is "no reading" rather than 0% -- see
@@ -240,8 +257,8 @@ void tb_slave_init(void)
     memcpy((void *)&s_live, &s_stage, sizeof(s_stage));
     memcpy(s_tx, &s_stage, sizeof(s_stage));
 
-    memset((void *)&s_ppg, 0, sizeof(s_ppg));
-    memset(s_ppg_tx, 0, sizeof(s_ppg_tx));
+    memset((void *)&s_wave, 0, sizeof(s_wave));
+    memset(s_wave_tx, 0, sizeof(s_wave_tx));
 
     s_ptr = 0U;
     s_ptr_valid = false;
@@ -447,10 +464,10 @@ void tb_slave_set_rssi(int8_t dbm)
     s_stage.lora_rssi = dbm;
 }
 
-void tb_slave_ppg_push(float ir, float red)
+void tb_slave_wave_push(float ir, float red, uint16_t ecg)
 {    /* All of it is in tb_regs.h, next to the layout it has to agree with, and
-     * host-tested there -- see tb_ppg_push() for why total is stored last. */
-    tb_ppg_push(&s_ppg, ir, red);
+     * host-tested there -- see tb_wave_push() for why total is stored last. */
+    tb_wave_push(&s_wave, ir, red, ecg);
 }
 
 uint8_t tb_slave_take_cmd(void)
@@ -483,6 +500,43 @@ uint8_t tb_slave_host_battery(void)
     return s_host_battery;
 }
 
+/*
+ * The one take in this file that needs a critical section, and the reason is the
+ * pair, not the flag.
+ *
+ * tb_slave_take_result() above reads two INDEPENDENT bytes: an interrupt landing
+ * between them mixes a new priority with an old confidence, which is a slightly
+ * stale confidence on the right triage level. Systolic and diastolic are not
+ * independent -- a sys from this model run beside a dia from the last one can be
+ * physiologically impossible (dia > sys) and is unrecoverable downstream, since
+ * the station has no way to know the two halves came from different predictions.
+ *
+ * Masking only I2C2_EV_IRQn, exactly as tb_slave_publish() does: the ADC/DMA ISR
+ * must keep running or the ECG window drops samples, and the write path this
+ * races is entirely inside HAL_I2C_SlaveRxCpltCallback. Three loads and a store
+ * long, i.e. shorter than the publish memcpy it borrows the idiom from -- the
+ * master stretches by nothing it can measure.
+ */
+bool tb_slave_take_bp(uint16_t *sys, uint16_t *dia)
+{
+    bool fresh;
+
+    HAL_NVIC_DisableIRQ(I2C2_EV_IRQn);
+    fresh = s_bp_fresh;
+    if (fresh) {
+        if (sys != NULL) {
+            *sys = s_bp_sys;
+        }
+        if (dia != NULL) {
+            *dia = s_bp_dia;
+        }
+        s_bp_fresh = false;
+    }
+    HAL_NVIC_EnableIRQ(I2C2_EV_IRQn);
+
+    return fresh;
+}
+
 /* ---- ISR half: copies bytes, nothing else ------------------------------- */
 
 void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection,
@@ -505,15 +559,15 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection,
 
         /* Latch whichever block was addressed. This is the instant that makes a
          * multi-byte read coherent, and only the block actually being read is
-         * copied -- the waveform block is 132 bytes and there is no reason to
+         * copied -- the waveform block is 124 bytes and there is no reason to
          * pay for it on a vitals poll. */
         if (start < sizeof(s_tx)) {
             memcpy(s_tx, (const void *)&s_live, sizeof(s_tx));
             src = &s_tx[start];
             len = (uint16_t)(sizeof(s_tx) - start);
         } else if ((start >= TB_REG_PPG_BASE) && (start < TB_REG_PPG_END)) {
-            memcpy(s_ppg_tx, (const void *)&s_ppg, sizeof(s_ppg_tx));
-            src = &s_ppg_tx[start - TB_REG_PPG_BASE];
+            memcpy(s_wave_tx, (const void *)&s_wave, sizeof(s_wave_tx));
+            src = &s_wave_tx[start - TB_REG_PPG_BASE];
             len = (uint16_t)(TB_REG_PPG_END - start);
         } else {
             /* Out-of-range pointer, or the write block, which is not readable.
@@ -563,6 +617,42 @@ void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c)
              * could not read the gauge, and passing it through unchanged is what
              * makes the station omit the key instead of reporting a flat pack. */
             s_host_battery = byte;
+            break;
+        /*
+         * Blood pressure from the ESP32's model: two little-endian u16s, so four
+         * interrupts. They assemble into s_bp_wr_* and only reach s_bp_* on the
+         * fourth byte -- see TB_REG_HOST_BP_SYS in tb_regs.h for why the commit
+         * point is DIA's high byte and not the first byte of DIA.
+         *
+         * The high-byte cases are `| (byte << 8)` onto a value the low-byte case
+         * has already replaced outright, so a master that writes only the high
+         * halves cannot smuggle in the previous run's low bytes: it would build
+         * a value out of a stale low half, and the range test below is what
+         * catches that rather than the assembly.
+         */
+        case TB_REG_HOST_BP_SYS:
+            s_bp_wr_sys = byte;
+            break;
+        case TB_REG_HOST_BP_SYS + 1U:
+            s_bp_wr_sys = (uint16_t)(s_bp_wr_sys | ((uint16_t)byte << 8));
+            break;
+        case TB_REG_HOST_BP_DIA:
+            s_bp_wr_dia = byte;
+            break;
+        case TB_REG_HOST_BP_DIA + 1U:
+            s_bp_wr_dia = (uint16_t)(s_bp_wr_dia | ((uint16_t)byte << 8));
+            /* The pair is complete here, so this is where it is judged.
+             * Rejection discards BOTH values and leaves the previous good pair
+             * standing: a model extrapolating outside its training set returns a
+             * number rather than an error, and a stale reading is recoverable
+             * where 300/250 stamped into a LoRa packet is not. */
+            if (tb_bp_pair_valid(s_bp_wr_sys, s_bp_wr_dia)) {
+                s_bp_sys = s_bp_wr_sys;
+                s_bp_dia = s_bp_wr_dia;
+                s_bp_fresh = true;
+            } else {
+                ++mon_bp_writes_rejected;
+            }
             break;
         default:
             break;

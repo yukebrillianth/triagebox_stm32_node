@@ -46,8 +46,10 @@ void tb_slave_service(void);
  * Publish a consistent snapshot for the master to read. Call from the superloop
  * with the latest values; cheap (a struct fill plus a memcpy of ~48 bytes).
  *
- * bp_sys/bp_dia are accepted but must be 0 with TB_FLAG_BP_VALID clear until a
- * BP method exists -- see tb_regs.h.
+ * bp_sys/bp_dia are the ESP32's own ML prediction, taken back off this link with
+ * tb_slave_take_bp() and echoed here so every consumer of the read block sees one
+ * BP field -- see tb_regs.h. Pass 0/0 with TB_FLAG_BP_VALID clear when no
+ * validated pair has arrived.
  */
 void tb_slave_publish(uint8_t flags, uint8_t buttons, uint16_t hr,
                       uint16_t spo2, uint16_t rr_x10, uint16_t bp_sys,
@@ -76,16 +78,22 @@ void tb_slave_publish(uint8_t flags, uint8_t buttons, uint16_t hr,
 void tb_slave_set_rssi(int8_t dbm);
 
 /*
- * Append one smoothed PPG sample, in raw MAX30102 counts, to the waveform ring
- * the ESP32 reads at TB_REG_PPG_BASE. Call once per sample at TB_PPG_FS_HZ,
- * from wherever the sample is produced -- two packs and two stores, no HAL, no
- * critical section, so it is safe from an ISR as well as the superloop.
+ * Append one waveform sample -- smoothed PPG in raw MAX30102 counts plus the
+ * latest ECG value in raw ADC counts -- to the ring the ESP32 reads at
+ * TB_REG_PPG_BASE. Call once per sample at TB_PPG_FS_HZ, from wherever the PPG
+ * sample is produced: three packs and three stores, no HAL, no critical section,
+ * so it is safe from an ISR as well as the superloop.
+ *
+ * The three channels must describe the SAME instant as closely as the two
+ * sources allow -- the ESP32's BP model measures the delay between the ECG R wave
+ * and the finger pulse, so a pairing error is a pressure error. See the push site
+ * in main.c for the ~5ms of jitter that costs.
  *
  * Never blocks and never drops on this side: if the ESP32 stops reading, the
  * ring keeps turning and the ESP32 sees the gap in the sample counter. See the
  * ring contract in tb_regs.h.
  */
-void tb_slave_ppg_push(float ir, float red);
+void tb_slave_wave_push(float ir, float red, uint16_t ecg);
 
 /*
  * Pending command from the master, or TB_CMD_NONE. Reading it clears it, so
@@ -99,6 +107,20 @@ uint8_t tb_slave_take_cmd(void);
  * 3=GREEN) -- that is what the LoRa packet wants, so pass it through unchanged.
  */
 bool tb_slave_take_result(uint8_t *priority, uint8_t *confidence);
+
+/*
+ * Latest blood pressure the ESP32's model wrote, in mmHg. Returns false if no
+ * NEW validated pair has arrived since the last call, leaving @p sys and @p dia
+ * untouched -- so the caller keeps its own last-known copy rather than blanking
+ * a standing reading. A pair that failed tb_bp_pair_valid() never gets here; it
+ * is counted in mon_bp_writes_rejected instead.
+ *
+ * A take rather than state, unlike tb_slave_host_battery(), because the caller
+ * has to know a value is NEW: TB_FLAG_BP_VALID and the LoRa packet both carry
+ * the pair onwards, and "the model has spoken once" is a different fact from
+ * "the model spoke this second".
+ */
+bool tb_slave_take_bp(uint16_t *sys, uint16_t *dia);
 
 /*
  * The ESP32's fuel-gauge percentage, or 0xFF if it has not sent one or could not
@@ -119,5 +141,9 @@ extern volatile uint32_t mon_i2c_recoveries; /**< wedged-bus re-inits; >0 means
                                                   the bus jammed at least once.
                                                   0 is NOT proof it did not --
                                                   see tb_slave_service(). */
+/* BP pairs thrown away by tb_bp_pair_valid(). Climbing means the ESP32's model
+ * is predicting values a cuff could not produce, which is a model problem, not a
+ * link problem -- the writes themselves are landing, or this would not move. */
+extern volatile uint32_t mon_bp_writes_rejected;
 
 #endif /* TB_SLAVE_H */
