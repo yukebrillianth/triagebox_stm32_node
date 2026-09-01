@@ -66,6 +66,12 @@
 #define ECG_ADC_INDEX 0u
 #define MIC_ADC_INDEX 1u
 #define ANALOG_CHANNEL_COUNT 2u
+// How many raw ADC samples the boxcar in HAL_ADC_ConvCpltCallback averages into
+// one ECG value for the ESP32's waveform block. 497.5Hz / 5 = 99.5Hz, i.e. one
+// per PPG sample at TB_PPG_FS_HZ; the static assert next to max30102_plot proves
+// the two still line up. Nothing else may use this rate - the STM32's own ECG
+// window keeps the full 497.5Hz stream.
+#define ECG_WAVE_DECIM 5u
 // ECG window: DSP_ECG_WINDOW samples at DSP_ADC_FS_HZ = 6.03s, enough for 4-6
 // beats and so 3-5 R-R intervals to take a median over.
 #define ECG_BUFFER_SIZE DSP_ECG_WINDOW
@@ -169,6 +175,20 @@ static volatile uint8_t ecg_ready_bank = 0xFF; /* 0xFF = none pending */
 /* Raw inputs, updated at the acquisition rate. */
 volatile uint16_t mon_ecg_raw = 0; /**< 500Hz raw ECG sample, ADC LSB */
 volatile uint16_t mon_mic_raw = 0; /**< 500Hz raw mic sample, ADC LSB */
+/* The ECG as the ESP32 gets it: mon_ecg_raw averaged over 5 consecutive samples,
+ * so 497.5/5 = 99.5 Hz -- one value per PPG sample, which is what lets the two
+ * share a slot in the waveform block. Still raw ADC counts, not filtered: the
+ * boxcar is a decimation anti-alias, and everything the BP model wants from this
+ * channel (the R peak's position) survives it. Watch it against mon_ecg_raw; the
+ * shapes must match with the hash taken off.
+ *
+ * mon_ecg_staged_valid stays 0 until the first five samples have arrived, which
+ * is 10 ms after the ADC starts. It exists because 0 counts is a legal reading
+ * (an input on the bottom rail), so the value alone cannot say "nothing staged
+ * yet" -- and if this ever reads 0 with mon_adc_samples climbing, the boxcar
+ * below is the thing that stopped, not the ADC. */
+volatile uint16_t mon_ecg_staged = 0;
+volatile uint8_t mon_ecg_staged_valid = 0;
 volatile uint32_t mon_ir_raw = 0; /**< latest MAX30102 IR count */
 volatile uint32_t mon_red_raw = 0; /**< latest MAX30102 RED count */
 /* Same two channels after the 10Hz linear-phase FIR, plus the IR pulse with
@@ -351,6 +371,26 @@ volatile uint32_t mon_cmds = 0;
  * has scored anything would report the patient as dead. */
 volatile uint8_t mon_priority = LORA_VITAL_PRIORITY_NONE;
 volatile uint8_t mon_confidence = 0;
+/* Blood pressure as predicted by the ESP32's ML model and written back over I2C
+ * (TB_REG_HOST_BP_SYS/DIA), in mmHg. STICKY, like mon_priority above and for the
+ * same reason: a vital transmitted between predictions should carry the standing
+ * pressure rather than drop to "no reading", and both links must show the same
+ * pair -- the LoRa packet and the I2C snapshot are built from these two variables
+ * and never from a second take.
+ *
+ * 0/0 with mon_bp_valid clear until the first validated pair arrives, which is
+ * what keeps TB_FLAG_BP_VALID honest at boot. Once set, mon_bp_valid never goes
+ * back to 0: a model that has spoken has given this node a reading, and there is
+ * no staleness rule here to un-say it. Rejected pairs never reach these (see
+ * mon_bp_writes_rejected in tb_slave.c), so a bad prediction leaves the last good
+ * one standing rather than blanking the field. */
+volatile uint16_t mon_bp_sys = 0;
+volatile uint16_t mon_bp_dia = 0;
+volatile uint8_t mon_bp_valid = 0;
+/* How many validated pairs have arrived. The one number that separates "the
+ * ESP32 is not writing" from "the ESP32 is writing values the range test throws
+ * away" -- read it beside mon_bp_writes_rejected. */
+volatile uint32_t mon_bp_updates = 0;
 
 /* ---- RFID (PN532 on I2C3) ------------------------------------------------ */
 /* The tag as ASCII hex, which is what goes on the wire and onto the ESP32's
@@ -708,6 +748,30 @@ int main(void)
 
 		ServiceRfid();
 
+		/* The ESP32's BP prediction, taken ONCE per pass and cached in the mon_
+		 * globals, which is what makes the LoRa packet and the I2C snapshot agree.
+		 *
+		 * tb_slave_take_bp() consumes the fresh flag, so calling it from both
+		 * publish sites would give whichever ran first the reading and the other
+		 * nothing. Taking here instead -- before PublishToEsp32(), so a pair that
+		 * arrived this pass is in the very next snapshot, and before any
+		 * PackTelemetry() the next poll triggers -- means the take happens in one
+		 * place and everything downstream reads state.
+		 *
+		 * Sticky on purpose: nothing clears mon_bp_* on a quiet pass. The flag
+		 * says "new", the variables say "last known", and only a new validated
+		 * write moves them; a rejected pair does not reach here at all. */
+		{
+			uint16_t sys;
+			uint16_t dia;
+			if (tb_slave_take_bp(&sys, &dia)) {
+				mon_bp_sys = sys;
+				mon_bp_dia = dia;
+				mon_bp_valid = 1U;
+				++mon_bp_updates;
+			}
+		}
+
 		PublishToEsp32();
 
 		{
@@ -813,6 +877,53 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 		}
 	}
 
+	/* ---- ECG for the ESP32: 5-sample boxcar, staged for the waveform ring ----
+	 *
+	 * The waveform block carries one ECG value per PPG sample, and the two
+	 * sources run at different rates: this ADC at DSP_ADC_FS_TRUE_HZ = 497.5 Hz
+	 * (TIM2's real rate, not the integer DSP_ADC_FS_HZ used for sizing buffers),
+	 * the MAX30102 at DSP_PPG_FS_HZ = 100 Hz. Five raw samples per staged value
+	 * brings the ECG to 99.5 Hz, which is the closest integer ratio there is.
+	 *
+	 * A boxcar rather than a decimating pick-one-in-five, because dropping four
+	 * samples out of five folds everything above the new 49.75 Hz Nyquist back
+	 * down, and the bands that land on the 5-30 Hz QRS -- 70-95 Hz, 105-130 Hz,
+	 * 170-195 Hz -- are exactly where the AD8232's broadband noise sits. The
+	 * 5-tap mean nulls at 99.5 Hz and its multiples and holds those bands at least
+	 * 8 dB down, 25 dB and better through their middles: a cheap partial
+	 * anti-alias rather than a brick wall, which is the right trade for four adds
+	 * in an ISR. The 50 Hz mains line is only 3.8 dB down and does not need to be:
+	 * it folds to 49.5 Hz, i.e. back to just below Nyquist and still clear of the
+	 * QRS band. None of this touches the STM32's own ECG path -- that one keeps
+	 * the full 497.5 Hz stream in ecg_buffer above.
+	 *
+	 * ponytail: 99.5 Hz against the 100.0 Hz the ESP32 assumes is a 0.5% error in
+	 * the time axis, so a pulse transit time measured across one beat is out by
+	 * under 1 ms -- an order of magnitude below the ~10 ms PTT differences the BP
+	 * model works with, and it does not accumulate because each PTT is measured
+	 * inside a single beat rather than counted from the start of the record.
+	 * Upgrade path: a proper fractional resampler here (or a 500 Hz ECG channel
+	 * with its own counter in the block) if the model turns out to care.
+	 */
+	{
+		static uint32_t ecg_box_sum = 0;
+		static uint8_t ecg_box_n = 0;
+
+		ecg_box_sum += ecg_sample;
+		if (++ecg_box_n >= ECG_WAVE_DECIM) {
+			/* A divide, not the shift a power-of-two window would allow: /4
+			 * would leave a 1.25x gain on a field documented as raw ADC counts,
+			 * and the ESP32 would scale the R wave it measures amplitudes from.
+			 * UDIV is a handful of cycles on Cortex-M4, once per 5 samples at
+			 * 497.5 Hz, i.e. under 0.01% of the ISR budget. */
+			mon_ecg_staged = (uint16_t) ((ecg_box_sum + (ECG_WAVE_DECIM / 2U))
+					/ ECG_WAVE_DECIM);
+			mon_ecg_staged_valid = 1U;
+			ecg_box_sum = 0U;
+			ecg_box_n = 0U;
+		}
+	}
+
 	/* ---- Respiratory: mic sample into the envelope detector ---- */
 	Dsp_MicPushSample(mic_sample);
 }
@@ -884,6 +995,28 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 _Static_assert(TB_PPG_FS_HZ == DSP_PPG_FS_HZ,
 		"tb_regs.h TB_PPG_FS_HZ must track dsp_utils.h DSP_PPG_FS_HZ");
 
+/* The ECG channel in that block is staged by the boxcar in
+ * HAL_ADC_ConvCpltCallback, which divides the ADC rate by ECG_WAVE_DECIM. The
+ * result has to land within a few percent of the PPG rate the block declares, or
+ * the ESP32 is putting two different time axes on one sample slot. The bound is
+ * 5% and the real error is 0.5%; it is a range rather than an equality because
+ * 497.5 / 5 is not 100 and never will be -- see the ponytail note at the boxcar
+ * for what that costs. Integer arithmetic in permille, so it needs no float. */
+_Static_assert(((DSP_ADC_FS_HZ * 1000U) / (ECG_WAVE_DECIM * TB_PPG_FS_HZ)) >= 950U
+		&& ((DSP_ADC_FS_HZ * 1000U) / (ECG_WAVE_DECIM * TB_PPG_FS_HZ)) <= 1050U,
+		"the ECG boxcar no longer lands near TB_PPG_FS_HZ");
+
+/* And the block has to be reachable at all. The I2C register pointer is one
+ * byte, so a ring size or a base that pushes the tail past 0xFF makes the last
+ * samples silently unreadable -- the slave clamps the length and the ESP32 parses
+ * a short read as a complete one. tb_link_selftest.c pins this too; it is here as
+ * well so the firmware build fails on it without a host toolchain, since the ring
+ * size is now dictated by exactly this ceiling. */
+_Static_assert(TB_REG_PPG_END <= 0x100U,
+		"the waveform block runs past the one-byte register pointer");
+_Static_assert(sizeof(tb_wave_block_t) == (TB_REG_PPG_END - TB_REG_PPG_BASE),
+		"tb_wave_block_t and TB_REG_PPG_END disagree about the block size");
+
 void max30102_plot(uint32_t ir_sample, uint32_t red_sample) {
 #if MON_SPO2_SWAP_CHANNELS
 	uint32_t ir = red_sample;
@@ -917,12 +1050,39 @@ void max30102_plot(uint32_t ir_sample, uint32_t red_sample) {
 	mon_ppg_contact = (smooth.red >= DSP_PPG_MIN_DC) ? 1U : 0U;
 
 	/* Hand the smoothed waveform to the ESP32, which does its own PPG
-	 * processing. Both channels in raw counts, already swapped above, so what
-	 * the ESP32 calls IR is physically IR -- the driver's label confusion stops
-	 * here and never crosses the link. The ring absorbs the gap between this
-	 * 100Hz push and however often the ESP32 gets round to reading it; see
-	 * tb_regs.h for what it must do with the sample counter. */
-	tb_slave_ppg_push(smooth.ir, smooth.red);
+	 * processing and runs the BP model on it. Both PPG channels in raw counts,
+	 * already swapped above, so what the ESP32 calls IR is physically IR -- the
+	 * driver's label confusion stops here and never crosses the link. The ring
+	 * absorbs the gap between this 100Hz push and however often the ESP32 gets
+	 * round to reading it; see tb_regs.h for what it must do with the sample
+	 * counter.
+	 *
+	 * The ECG rides along as the LATEST staged value rather than one carried in
+	 * from the sample instant, because the two sensors have no shared clock: the
+	 * MAX30102 announces a sample over I2C1 whenever its FIFO says so, and the
+	 * ADC stages one every 10.05 ms from TIM2. So the pair is "the newest ECG at
+	 * the moment this PPG sample arrived", which is what the block's one-counter
+	 * layout can express.
+	 *
+	 * ponytail: that gives up to one staging period, ~10 ms, of pairing skew,
+	 * uniformly distributed, so ±5 ms about the mean. It is the largest single
+	 * error in a pulse transit time and it is deliberately left: PTT features are
+	 * means over several beats, and a zero-mean jitter averages down as
+	 * 5/sqrt(beats) ms -- under 2 ms across an 8-beat window, which is inside the
+	 * model's own input noise. Upgrade path if it turns out to matter: timestamp
+	 * both sources off HAL_GetTick (or a free-running TIM) and interpolate the ECG
+	 * to the PPG instant, which needs a second field in the sample or a shared
+	 * time base on the wire. Before doing that, check the MAX30102's own FIFO
+	 * latency -- smp_ave_8 at sr_800 is itself a 10 ms group delay, so the ECG is
+	 * not the biggest unknown in the pairing.
+	 *
+	 * Zero until the boxcar has its first five samples, which is 10 ms after the
+	 * ADC starts and long before the MAX30102's first FIFO word. Pushed
+	 * unconditionally: mon_ecg_staged_valid is the diagnostic that distinguishes
+	 * "nothing staged yet" from a measured 0, and 0 counts is what an unplugged
+	 * AD8232 reads anyway, so gating the push would only cost the ESP32 the PPG
+	 * samples in the same slot. */
+	tb_slave_wave_push(smooth.ir, smooth.red, mon_ecg_staged);
 }
 
 /* Builds the LoRa uplink packet from the mon_* globals, immediately before the
@@ -991,10 +1151,14 @@ static void PackTelemetry(void) {
 	 * guards a future change to that range. */
 	mon_lora_vital.rr = (uint8_t) ((brpm > 254.0f) ? 255U :
 									(brpm > 0.0f) ? (uint8_t) (brpm + 0.5f) : 0U);
-	/* BP has no source; TB_FLAG_BP_VALID stays clear in mon_flags and the
-	 * station omits the keys rather than publishing a fabricated 0/0. */
-	mon_lora_vital.bp_sys = 0U;
-	mon_lora_vital.bp_dia = 0U;
+	/* The ESP32's ML prediction, arriving at TB_REG_HOST_BP_SYS/DIA and taken
+	 * once per superloop pass into these globals -- see the take site. mon_flags
+	 * carries TB_FLAG_BP_VALID from the same pair, so the station never sees a
+	 * pressure without the bit or a bit without a pressure. 0/0 with the bit
+	 * clear until the model has spoken, which is what makes the station omit the
+	 * keys rather than publish a fabricated 0/0. */
+	mon_lora_vital.bp_sys = mon_bp_sys;
+	mon_lora_vital.bp_dia = mon_bp_dia;
 	/* The gauge is the ESP32's SW6106 PMIC, not ours -- it arrives over I2C at
 	 * TB_REG_HOST_BATTERY. 0xFF when it has not sent one yet, which is exactly
 	 * LORA_VITAL_BATTERY_NONE, so the station omits the key as before. */
@@ -1354,10 +1518,19 @@ static void PublishToEsp32(void) {
 		flags |= TB_FLAG_RR_VALID;
 		sensors |= TB_SENSOR_MIC;
 	}
-	/* TB_FLAG_BP_VALID stays clear and BP stays 0: nothing measures pressure.
-	 * PA2 is the breathing microphone now, so the MPX5010 path is gone. The
-	 * ESP32's SVM uses BP as 2 of its 5 features and must see the bit clear
-	 * rather than believe a fabricated 0/0. */
+	/* BP is the ESP32's own ML prediction coming back across the link, not a
+	 * measurement this board takes -- there is no cuff, and PA2 is the breathing
+	 * microphone, so the MPX5010 path is long gone. The bit tracks mon_bp_valid,
+	 * i.e. "a pair that passed tb_bp_pair_valid() is standing", so it is clear
+	 * from boot until the model first speaks and the ESP32's SVM sees a missing
+	 * feature rather than a fabricated 0/0.
+	 *
+	 * Set from the same variables PackTelemetry() reads, so the flag and the
+	 * numbers cannot disagree between the two links -- the failure that would
+	 * cause is a station publishing a pressure the screen says is invalid. */
+	if (mon_bp_valid != 0U) {
+		flags |= TB_FLAG_BP_VALID;
+	}
 	if (lora_status == LORA_OK) {
 		sensors |= TB_SENSOR_LORA;
 	}
@@ -1379,8 +1552,15 @@ static void PublishToEsp32(void) {
 	tb_slave_publish(flags, mon_buttons, mon_rate_bpm,
 			(uint16_t) (mon_spo2_pct + 0.5f),
 			(uint16_t) ((ResolvedRespBrpm() * 10.0f) + 0.5f),
-			0U, /* bp_sys: no source yet */
-			0U, /* bp_dia: no source yet */
+			/* Echoed back, like the battery below and for the same reason:
+			 * TB_REG_BP_SYS/BP_DIA are "the patient's blood pressure" to
+			 * everyone reading this block, and there is exactly one source for
+			 * it. Echoing also makes the write verifiable with `i2creg` -- if
+			 * these read back 0/0 after the ESP32 wrote a pair, the write was
+			 * rejected by tb_bp_pair_valid() and mon_bp_writes_rejected says so.
+			 * Same variables PackTelemetry() uses, so both links agree. */
+			mon_bp_sys,
+			mon_bp_dia,
 			/* Echoed back rather than left at 0xFF: TB_REG_BATTERY is "the
 			 * node's battery" to everyone reading this block, and there is
 			 * exactly one gauge on this node. Echoing also makes the write
