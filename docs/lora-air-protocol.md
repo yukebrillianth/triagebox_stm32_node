@@ -93,15 +93,22 @@ the header, and acting on a packet you cannot parse is worse than dropping it.
 accept polls from any station, or filter on this field if two stations ever share
 a channel — the station does not care which, so this is the node's call.
 
-## Uplink: the reply (node → station, 18–38 bytes)
+## Uplink: the reply (node → station, 21–41 bytes)
 
-`lora_vital_t` from `Core/Inc/lora_vital.h`, unchanged from the free-running
-design — only *when* it is sent has changed, not what it contains. Transmit
-`lora_vital_len(&v)` bytes: the 18-byte fixed part plus however many characters
-of RFID tag there are, which is usually zero.
+`lora_vital_t` from `Core/Inc/lora_vital.h`. Transmit `lora_vital_len(&v)` bytes:
+the 21-byte fixed part plus however many characters of RFID tag there are, which is
+usually zero.
+
+`LORA_VITAL_VERSION` is **0x02**, which appended `esi`, `age` and `gender` after
+`confidence` — the operator's answers and the model's raw 1..5, none of which the
+STM32 measures and all of which it only carries. All three use 0 for "nobody
+supplied this" and the station must omit the key rather than publish the zero: a 0
+age reads as a newborn, ESI has no class 0, and 0 is not an ASCII letter. The
+packet grew, so **the node and the station flash together** — unlike `tb_regs.h`,
+where the read block never moved and an old slave degrades gracefully.
 
 The station validates with `lora_vital_valid()` and drops anything that fails, so
-the fields that must be right are `version` (0x01) and `victim_rfid_len` (≤ 20 and
+the fields that must be right are `version` (0x02) and `victim_rfid_len` (≤ 20 and
 consistent with the length actually transmitted).
 
 `node_id` in the reply must be the node's own address. **The station checks it
@@ -123,12 +130,20 @@ read fails, a real percentage otherwise.
 the flag set is published as current; a fresh reading with the flag clear is
 thrown away. Set them honestly.
 
+**`TB_FLAG_RR_VALID` means "this is the RR the verdict was computed from"**, not
+"a microphone measured it". Until the breathing mic is fitted, the only source is
+the operator's four-band answer travelling backwards over I²C
+(`TB_REG_HOST_RR`), and it is the number `tb_classify()` already scores against —
+so the bit is set from it and the same value is stamped into `rr`. When the mic
+ships, the node switches the bit's source and the meaning restores itself with no
+wire change.
+
 ## Timing — the part that bites
 
 ```
 station:  [--- poll ~30ms ---]                          [--- next poll ---]
 node:                          (snapshot + turnaround)
-node:                            [------ reply 51-82ms ------]
+node:                            [------ reply 57-87ms ------]
                           |<----------- 250ms slot ----------->|
 ```
 
@@ -219,10 +234,17 @@ place for it to fail.
 
 ## Airtime budget
 
-At the settings above: a poll is ~30 ms, an empty vital ~51 ms, a vital with a
-20-character tag ~82 ms. A 20-node cycle is about 5 s of traffic inside a 15 s
+At the settings above: a poll is ~30 ms, an empty vital ~57 ms, a vital with a
+20-character tag ~88 ms. A 20-node cycle is about 5 s of traffic inside a 15 s
 period, so the station transmits roughly 4% duty and each node well under 1% —
 comfortably under the 10% ceiling common on this band.
+
+Those reply figures went up ~5 ms when `LORA_VITAL_VERSION` reached 0x02: three
+more payload bytes cost one more block of symbols at SF7 (43 symbols empty, 73
+with a full tag). `LORA_REPLY_AIRTIME_MS` is still 90, so the compile-time budget
+(`deadline 150 + airtime 90 < slot 250`) still holds, but the headroom is now
+~2 ms — weigh the next field on `lora_vital_t` against that constant, not just
+against the struct.
 
 Adding a field to `lora_poll_t` costs airtime 20 times per cycle. Weigh new
 downlink fields against that, not against the reply.
@@ -245,11 +267,35 @@ Kept as a checklist because it is what a second node type would have to satisfy.
 
 1. Delete the free-running transmit and `NODE_REPORT_INTERVAL`.
 2. Sit in RX continuous. Do not set the sync word or the frequency define.
-3. On a packet, `lora_poll_for_me(p, len, MY_NODE_ID)`. False → back to RX, no log.
+3. On a packet, `lora_poll_for_me(p, len, MY_NODE_ID)` — `MY_NODE_ID` is the
+   UID-table lookup's result, `mon_node_id` on this firmware. False → back to RX,
+   no log.
+
+**Every physical node needs its own address, and it comes from the chip's UID, not
+from the build.** `NODE_ID` used to be a committed `1` that nothing in any build
+path overrode, so every board flashed from this repository was node 1. Two nodes on
+one address both answer the same poll; the stronger reply wins the collision,
+carries the `node_id` the station asked for, and two patients' vitals alternate
+under one MQTT identity with no message anywhere naming the cause.
+
+So `main.c` carries a `static const` table mapping the 96-bit factory UID to a node
+id, looked up once at boot — one binary for the whole fleet, no per-board build
+configuration. **To add a board:** run the ESP32 console's `uid` command, which
+prints the twelve bytes the STM32 publishes at `TB_REG_UID` (`0x31`), paste them
+into `k_node_uids` and pick the next free id in `1..LORA_POLL_NODE_MAX`.
+
+**A UID that is not in the table resolves to 0, and the node then answers
+nothing.** `lora_poll_for_me()` never matches a 0 id, so an unprovisioned board is
+silent on the channel, clears `TB_SENSOR_LORA` so the ESP32's status dot shows it,
+and reports `mon_node_id == 0` over SWD. That is deliberate: a silent board is a
+one-line diagnosis, while a second board answering as node 1 corrupts another
+patient's record and looks like working telemetry. `-DNODE_ID=N` survives as an
+escape hatch for a board not yet in the table; the table wins when it matches.
 4. Unknown command → back to RX, silently.
 5. `LORA_POLL_CMD_REPORT` → snapshot, fill `lora_vital_t`, `node_id` = own id,
-   `version` = 0x01, flags set honestly, unscored priority = 0xFF, battery from
-   `tb_slave_host_battery()` or 0xFF if there is no reading.
+   `version` = 0x02, flags set honestly, unscored priority = 0xFF, battery from
+   `tb_slave_host_battery()` or 0xFF if there is no reading, and `esi`/`age`/
+   `gender` from the write block or 0 if the operator never answered.
 6. Transmit `lora_vital_len(&v)` bytes, well inside 250 ms of the poll arriving.
 7. Straight back to RX. Never transmit from anywhere else in the firmware.
 8. Latch `LoRa_getRSSI()` **before** transmitting — see below.

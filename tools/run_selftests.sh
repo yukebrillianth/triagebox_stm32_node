@@ -106,10 +106,21 @@ sed -n '/^#define NODE_ID /,/^#define LORA_IRQ_CRC_ERROR /p' Core/Src/main.c \
 # endings, so a bare /^}$/ matches nothing and the range runs to end of file.
 sed -n '/^_Static_assert(LORA_REPLY_DEADLINE_MS/,/^}[[:space:]]*$/p' \
     Core/Src/main.c > "$OUT/svc_body.inc"
+# The UID -> node_id table and its lookup, cut out the same way and for the same
+# reason. It stops at NodeIdFromUid()'s closing brace, which is why ResolveNodeId()
+# sits after it in main.c: that one reads UID_BASE and could not compile here.
+sed -n '/^\/\* ---- Node identity/,/^}[[:space:]]*$/p' \
+    Core/Src/main.c > "$OUT/node_id.inc"
 grep -q '^#define LORA_REPLY_DEADLINE_MS ' "$OUT/svc_defs.inc" \
     || { echo "cannot find the LoRa defines in main.c"; exit 1; }
 grep -q 'mon_lora_reply_ms' "$OUT/svc_body.inc" \
     || { echo "cannot find ServiceLoRaPoll() in main.c"; exit 1; }
+grep -q 'k_node_uids\[\] = {' "$OUT/node_id.inc" \
+    || { echo "cannot find the UID table in main.c"; exit 1; }
+grep -q 'return id;' "$OUT/node_id.inc" \
+    || { echo "cannot find NodeIdFromUid() in main.c"; exit 1; }
+grep -q 'UID_BASE' "$OUT/node_id.inc" \
+    && { echo "the extracted lookup reads UID_BASE; it cannot be host-tested"; exit 1; }
 # -std=c11 overrides the c99 above (last -std wins) because the extracted block
 # opens with main.c's two _Static_asserts, which are the compile-time proof that
 # deadline + airtime fits inside the slot. Under -std=c99 -pedantic gcc rejects

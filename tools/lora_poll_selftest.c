@@ -52,6 +52,16 @@ static volatile uint32_t mon_lora_rx, mon_lora_polls, mon_lora_crc;
 static volatile uint32_t mon_lora_stale, mon_lora_reply_ms;
 static volatile int16_t mon_lora_rssi;
 static lora_vital_t mon_lora_vital;
+/* This node's address, which main.c resolves from the UID table below rather than
+ * from a compile-time constant. 1 here so the scripted polls in main() are
+ * addressed to this node; the no-address case sets it to 0 explicitly. */
+static volatile uint8_t mon_node_id = 1U;
+
+/* The table and the lookup, cut out of main.c by run_selftests.sh -- the same
+ * arrangement as svc_body.inc, so main.c stays the only copy. Needs NODE_ID from
+ * svc_defs.inc above, which is 0 here: no -DNODE_ID on this build line, so an
+ * unknown UID has nowhere to fall back to, which is the case worth testing. */
+#include "node_id.inc"
 
 /* ---- scripted radio ---- */
 static uint32_t fake_tick;
@@ -196,11 +206,108 @@ static void pass(uint32_t dt)
 	ServiceLoRaPoll();
 }
 
+/*
+ * NodeIdFromUid(): which node this board thinks it is.
+ *
+ * The one value in this firmware whose failure is invisible AND destructive. Two
+ * boards on one address is a capture-effect lottery -- the stronger reply passes
+ * CRC carrying the node_id the station polled for, and two patients' vitals
+ * alternate under one MQTT identity with nothing anywhere reporting it. So the
+ * miss case is asserted as hard as the hit: an unknown UID must resolve to 0 and
+ * stay silent, never fall back to 1.
+ *
+ * The test supplies its OWN table because the shipped one cannot contain a real
+ * board's UID -- inventing one would hand a real board somebody else's identity --
+ * so a hit can only be exercised with a UID the test owns.
+ */
+static void test_node_id_from_uid(void)
+{
+	static const struct node_uid tab[] = {
+		{ { 0x33, 0x00, 0x35, 0x00, 0x0F, 0x51, 0x37, 0x38, 0x33, 0x31, 0x33,
+				0x39 }, 1U },
+		{ { 0x41, 0x00, 0x2A, 0x00, 0x11, 0x51, 0x37, 0x38, 0x33, 0x31, 0x33,
+				0x39 }, 7U },
+	};
+	const size_t n = sizeof(tab) / sizeof(tab[0]);
+	uint8_t uid[TB_REG_UID_LEN];
+	size_t i;
+
+	/* A hit returns that row's id, from either position in the table. */
+	assert(NodeIdFromUid(tab[0].uid, tab, n) == 1U);
+	assert(NodeIdFromUid(tab[1].uid, tab, n) == 7U);
+
+	/*
+	 * A MISS MUST BE 0, NOT 1, and that is this function's whole reason to
+	 * exist. NODE_ID is 0 on this build line, exactly as it is in the Makefile,
+	 * so an unprovisioned board has nowhere to fall back to -- and
+	 * lora_poll_for_me() refusing a 0 id is what turns that into silence.
+	 */
+	memcpy(uid, tab[0].uid, sizeof(uid));
+	uid[TB_REG_UID_LEN - 1U] ^= 0x01U; /* one bit off a known board */
+	assert(NodeIdFromUid(uid, tab, n) == 0U);
+	assert(!lora_poll_for_me((const lora_poll_t *) tab[0].uid, LORA_POLL_LEN,
+			NodeIdFromUid(uid, tab, n)));
+
+	/* Every byte is compared, so a UID matching on a PREFIX is still a miss.
+	 * That matters more than it looks: STM32 UIDs from one wafer share whole
+	 * words, so a prefix match would collide across a production batch. */
+	for (i = 0U; i < TB_REG_UID_LEN; ++i) {
+		memcpy(uid, tab[1].uid, sizeof(uid));
+		uid[i] ^= 0x80U;
+		assert(NodeIdFromUid(uid, tab, n) == 0U);
+	}
+
+	/* All zeros -- a failed read, or a struct nobody filled -- must miss as well.
+	 * It is also the shipped table's placeholder row, which carries id 0, so both
+	 * paths agree on "no address" rather than disagreeing quietly. */
+	memset(uid, 0, sizeof(uid));
+	assert(NodeIdFromUid(uid, tab, n) == 0U);
+
+	/* A row that is itself out of range fails the same way an unknown UID does
+	 * rather than being passed through: 0 would answer every node's poll and an
+	 * id above LORA_POLL_NODE_MAX is never polled at all. */
+	{
+		static const struct node_uid bad[] = {
+			{ { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+					0x0C }, LORA_POLL_NODE_MAX + 1U },
+			{ { 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+					0x1C }, 0U },
+			{ { 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B,
+					0x2C }, LORA_POLL_NODE_MAX },
+		};
+
+		assert(NodeIdFromUid(bad[0].uid, bad, 3U) == 0U);
+		assert(NodeIdFromUid(bad[1].uid, bad, 3U) == 0U);
+		/* ...and the largest legal id still passes, so the bound is a bound and
+		 * not an off-by-one that quietly retires the last address. */
+		assert(NodeIdFromUid(bad[2].uid, bad, 3U) == LORA_POLL_NODE_MAX);
+	}
+
+	/* The SHIPPED table, checked for the mistakes hand-editing invites: every
+	 * row inside the legal range, and no id or UID appearing twice -- two boards
+	 * on one address is the failure this table was added to end. */
+	for (i = 0U; i < (sizeof(k_node_uids) / sizeof(k_node_uids[0])); ++i) {
+		size_t j;
+
+		assert(k_node_uids[i].id <= LORA_POLL_NODE_MAX);
+		for (j = i + 1U; j < (sizeof(k_node_uids) / sizeof(k_node_uids[0])); ++j) {
+			assert(k_node_uids[i].id == 0U || k_node_uids[i].id
+					!= k_node_uids[j].id);
+			assert(memcmp(k_node_uids[i].uid, k_node_uids[j].uid,
+					TB_REG_UID_LEN) != 0);
+		}
+	}
+}
+
 int main(void)
 {
 	hlora.DIO0_port = &port_a;
 	hlora.DIO0_pin = 2U;
 	fake_tick = 1000U;
+
+	/* The address lookup, before anything that uses the address: if this is
+	 * wrong, every scripted poll below is testing the wrong node. */
+	test_node_id_from_uid();
 
 	/* First pass ever: a poll that latched during boot is answered, not
 	 * counted stale -- the `primed` guard. */
@@ -351,6 +458,24 @@ int main(void)
 	assert(mon_lora_stale == 1U && tx_count == 0U);
 	assert(rssi_publishes == 1U && published_rssi == -118);
 
-	printf("lora_poll_selftest: OK (ServiceLoRaPoll)\n");
+	/* A node with NO ADDRESS answers nothing. This is the unprovisioned board:
+	 * its UID is not in the table, so mon_node_id is 0, and lora_poll_for_me()
+	 * refuses every poll on the channel -- including a poll addressed to 0, which
+	 * a station has no reason to send but which would otherwise be answered by
+	 * every unprovisioned board at once. It still HEARS the traffic, so
+	 * mon_lora_rx climbing with polls stuck at 0 is the diagnosis. */
+	reset_counters();
+	mon_node_id = 0U;
+	arm_poll(0x01U, LORA_POLL_CMD_REPORT);
+	pass(10U);
+	assert(mon_lora_rx == 1U);
+	assert(mon_lora_polls == 0U && tx_count == 0U);
+	reset_counters();
+	arm_poll(0x00U, LORA_POLL_CMD_REPORT);
+	pass(10U);
+	assert(mon_lora_polls == 0U && tx_count == 0U);
+	mon_node_id = 1U;
+
+	printf("lora_poll_selftest: OK (ServiceLoRaPoll, NodeIdFromUid)\n");
 	return 0;
 }

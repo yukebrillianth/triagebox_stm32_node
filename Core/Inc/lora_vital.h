@@ -23,7 +23,7 @@
  * so neither conversion gets re-derived by hand.
  *
  *   {"victim_rfid","hr","spo2","rr","bp_sys","bp_dia","battery",
- *    "priority","confidence","reasons","ts"}
+ *    "priority","confidence","esi","age","gender","reasons","ts"}
  *
  * NOT ON THE WIRE, DELIBERATELY:
  *   ts        stamped by the station on receipt. A node with no RTC would send
@@ -38,8 +38,13 @@
  *             station's own radio, so the node cannot send them anyway.
  */
 
-/* Bump on ANY layout change. The station must check this before parsing. */
-#define LORA_VITAL_VERSION 0x01U
+/* Bump on ANY layout change. The station must check this before parsing.
+ * 0x02 appended age/gender/esi after confidence: operator facts and the model's
+ *      raw ESI, which the collapsed colour cannot carry (ESI 3/4/5 are all
+ *      GREEN). An 0x01 station rejects the longer packet by version, so the
+ *      station and the STM32 flash together or not at all -- unlike tb_regs.h,
+ *      where the read block never moved and old slaves degrade gracefully. */
+#define LORA_VITAL_VERSION 0x02U
 
 /*
  * Up to 20 characters, not TB_RFID_MAX's 31: the only source is a PN532 UID
@@ -76,6 +81,20 @@
 #define LORA_VITAL_BATTERY_NONE 0xFFU
 
 /*
+ * esi / age / gender all use 0 for "nobody supplied this", and 0 is safe for all
+ * three: the ESI scale starts at 1, no patient is 0 years old, and 0 is not an
+ * ASCII letter. The station omits the key rather than publishing the zero --
+ * same rule as battery above, for the same reason. A 0 age would read as a
+ * newborn and a 0 ESI as a class that does not exist.
+ *
+ * All three arrive from the ESP32 over I2C (TB_REG_HOST_AGE/GENDER/ESI); the
+ * STM32 measures none of them and only stamps them into this packet.
+ */
+#define LORA_VITAL_ESI_NONE    0U
+#define LORA_VITAL_AGE_NONE    0U
+#define LORA_VITAL_GENDER_NONE 0U
+
+/*
  * The fixed part, up to but not including victim_rfid. A packet is
  * LORA_VITAL_FIXED_LEN + victim_rfid_len bytes -- see lora_vital_len().
  *
@@ -91,7 +110,7 @@
  * header carries the payload length, so the receiver already knows how many
  * bytes arrived before it looks at the struct.
  */
-#define LORA_VITAL_FIXED_LEN 18U
+#define LORA_VITAL_FIXED_LEN 21U
 
 /*
  * Little-endian, packed, uint16_t fields at even offsets, so both ends can cast
@@ -112,6 +131,9 @@ typedef struct TB_PACKED {
 	uint8_t battery; /**< percent or LORA_VITAL_BATTERY_NONE -> "battery" */
 	uint8_t priority; /**< LORA_VITAL_PRIORITY_* -> "priority" (as a string) */
 	uint8_t confidence; /**< 0..100 -> "confidence" (as 0..1) */
+	uint8_t esi; /**< 1..5, 0 = the model did not score -> "esi" */
+	uint8_t age; /**< YEARS, not the UI's band; 0 = not asked -> "age" */
+	uint8_t gender; /**< 'M'/'F' ASCII, 0 = not asked -> "gender" */
 	uint8_t victim_rfid_len; /**< characters below; 0 = no tag scanned */
 	char victim_rfid[LORA_VITAL_RFID_MAX]; /**< ASCII hex, NOT NUL-terminated */
 } lora_vital_t;
@@ -153,6 +175,14 @@ static inline const char *lora_vital_priority_name(uint8_t wire)
 	default:
 		return NULL;
 	}
+}
+
+/** Node side: the one-byte gender for the wire. 'M'/'F'; anything else packs as
+ * 0 (LORA_VITAL_GENDER_NONE), which the station omits -- an unknown gender is
+ * not worth a key, and 'U' would read as a real answer downstream. */
+static inline uint8_t lora_vital_gender_byte(char g)
+{
+	return (g == 'M' || g == 'F') ? (uint8_t) g : LORA_VITAL_GENDER_NONE;
 }
 
 /** Station side: is this a packet we can parse at all? Length must cover the

@@ -81,7 +81,29 @@
 // maps it to the topic segment as node-%02u, so address 1 publishes under
 // node-01. It must be 1..LORA_POLL_NODE_MAX and unique on the channel -- 0 is
 // reserved (byte 0 of a poll is always 0, which is how a node tells a downlink
-// from another node's reply). Every physical node needs its own value here.
+// from another node's reply). Every physical node needs its own value.
+//
+// IT IS NO LONGER A BUILD-TIME CONSTANT, and the reason is that the build-time
+// version never worked. The value here was committed as 1, nothing in any build
+// path ever overrode it -- the Makefile passes no -DNODE_ID and .cproject has
+// zero occurrences -- so every board ever flashed from this repository is node 1.
+// Two of them on one station is a capture-effect lottery: whichever reply is
+// stronger passes CRC, it carries the node_id the station polled for, and two
+// patients' vitals alternate under one MQTT identity. Nothing anywhere reports
+// it. That is the worst failure this system can produce, and per-board build
+// configuration is exactly the thing mass production cannot be trusted to do.
+//
+// So the address comes from the chip's own factory UID, looked up in the table
+// at k_node_uids (further down, next to ServiceLoRaPoll). One binary, every
+// board, no per-board configuration. NodeIdFromUid() is the whole mechanism and
+// the comment there is the instructions for adding a board.
+//
+// This define survives as the ESCAPE HATCH for a board that is not in the table
+// yet: -DNODE_ID=2 still works and the table still wins over it when it matches.
+// It defaults to 0 rather than 1, and 0 means "this board has no address": it
+// refuses to transmit and clears TB_SENSOR_LORA so the ESP32's status dot shows
+// it. A board that says nothing is diagnosable from one screen; a second board
+// answering as node 1 quietly corrupts another patient's record.
 //
 // LORA_FREQUENCY and NODE_REPORT_INTERVAL are gone. The first was dead code:
 // the library takes MHz (hlora.frequency = 433 from newLoRa()) and never read
@@ -93,7 +115,17 @@
 // still being retried past the slot lands in the NEXT node's slot and destroys
 // that node's reply too. 100ms is above the ~82ms worst-case airtime and well
 // under the slot, so a stuck transmit gives up inside its own window.
-#define NODE_ID 0x01u
+#ifndef NODE_ID /* -DNODE_ID=N only for a board not yet in k_node_uids */
+#define NODE_ID 0u
+#else
+/* Only the override is checkable at compile time. A typo'd -DNODE_ID is
+ * silent on a radio in both directions: 0 answers every node's poll (see
+ * lora_poll_for_me), and above the maximum is never polled at all, which looks
+ * exactly like a dead node. The table's own ids are bounded at runtime instead
+ * -- see NodeIdFromUid(). */
+_Static_assert(NODE_ID >= 1u && NODE_ID <= LORA_POLL_NODE_MAX,
+		"-DNODE_ID must be 1..LORA_POLL_NODE_MAX; 0 is reserved and above the max is never polled");
+#endif
 #define LORA_TX_TIMEOUT 100u
 
 // How stale a poll may be before the node declines to answer it. The node
@@ -114,9 +146,16 @@
 // while the static assert below keeps deadline + airtime inside the slot.
 #define LORA_REPLY_DEADLINE_MS 150u
 
-// Worst-case airtime for the reply: 38 bytes (18 fixed + a full 20-character
-// tag) at SF7/BW125/CR4-5 with an 8-symbol preamble is ~82ms, rounded up. Only
-// used to prove the timing budget at compile time.
+// Worst-case airtime for the reply. 41 bytes now (LORA_VITAL_FIXED_LEN 21 plus a
+// full 20-character tag) at SF7/BW125/CR4-5 with an 8-symbol preamble: 13 payload
+// blocks, 73 symbols, ~87ms with the preamble. Only used to prove the timing
+// budget at compile time.
+//
+// The three fields LORA_VITAL_VERSION 0x02 appended cost 5ms of that -- 82ms at 38
+// bytes, 87ms at 41 -- because they pushed the payload over another 4-byte block
+// boundary. 90 still bounds it, but by 3ms rather than 8, so the next field added
+// to lora_vital_t has to be weighed against THIS constant and the assert below,
+// not just against the struct.
 #define LORA_REPLY_AIRTIME_MS 90u
 
 /* RegIrqFlags bit 5, PayloadCrcError. The LoRa library clears the whole flags
@@ -319,8 +358,10 @@ volatile uint32_t mon_lora_frames = 0;
  *                            frequency/SF/BW/CR/sync word. Diff the modem
  *                            registers before suspecting the protocol.
  *   rx climbing, polls == 0  packets arrive but none are for this node. Either
- *                            NODE_ID is outside the range the station polls, or
- *                            these are other nodes' replies (normal on a shared
+ *                            mon_node_id is 0 (this board's UID is not in the
+ *                            table, so it answers nothing -- check that first) or
+ *                            it is outside the range the station polls, or these
+ *                            are other nodes' replies (normal on a shared
  *                            channel), or LORA_POLL_VERSION differs between the
  *                            two copies of lora_poll.h.
  *   crc climbing             somebody is transmitting and the link is marginal.
@@ -349,6 +390,12 @@ volatile uint32_t mon_lora_crc = 0;
 volatile uint32_t mon_lora_stale = 0;
 volatile uint32_t mon_lora_reply_ms = 0;
 volatile int16_t mon_lora_rssi = 0;
+/* This node's radio address and MQTT identity, resolved once at boot from the
+ * factory UID -- see NodeIdFromUid(). 0 means NO ADDRESS: this board's UID is not
+ * in the table and no -DNODE_ID was given, so it answers no poll and clears
+ * TB_SENSOR_LORA. The first thing to read when a node never appears on the
+ * dashboard. */
+volatile uint8_t mon_node_id = 0;
 
 /* ---- ESP32 I2C link ----------------------------------------------------- */
 /* Debounce state for the 4 front-panel buttons. The published byte is
@@ -371,6 +418,12 @@ volatile uint32_t mon_cmds = 0;
  * has scored anything would report the patient as dead. */
 volatile uint8_t mon_priority = LORA_VITAL_PRIORITY_NONE;
 volatile uint8_t mon_confidence = 0;
+/* The model's raw ESI, 1..5, taken WITH the verdict above and sticky with it.
+ * LORA_VITAL_ESI_NONE (0) means the model refused to score, which is the same
+ * condition that leaves mon_priority at NONE -- the two always move together, and
+ * ForgetPatient() clears all three, because a score for a patient who has left
+ * describes nobody. */
+volatile uint8_t mon_esi = LORA_VITAL_ESI_NONE;
 /* Blood pressure as predicted by the ESP32's ML model and written back over I2C
  * (TB_REG_HOST_BP_SYS/DIA), in mmHg. STICKY, like mon_priority above and for the
  * same reason: a vital transmitted between predictions should carry the standing
@@ -438,10 +491,12 @@ volatile uint32_t mon_rfid_found = 0;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
+static void ResolveNodeId(void);
 static void PackTelemetry(void);
 static void PublishToEsp32(void);
 static void ServiceRfid(void);
 static void ServiceLoRaPoll(void);
+static void ForgetPatient(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -571,6 +626,11 @@ int main(void)
 	// arrives immediately finds the sensors already streaming.
 	tb_buttons_init(&btn_state);
 	tb_slave_init();
+	// Who is this board? Resolved from the chip's own UID, which tb_slave_init()
+	// has already published at TB_REG_UID so a new board can be added to the
+	// table with nothing but the ESP32's console. mon_node_id 0 means "not in
+	// the table": the node answers no poll rather than claiming somebody's id.
+	ResolveNodeId();
 	PublishToEsp32();
   /* USER CODE END 2 */
 
@@ -724,22 +784,43 @@ int main(void)
 		{
 			uint8_t cmd = tb_slave_take_cmd();
 			if (cmd != TB_CMD_NONE) {
-				/* START_SCAN is acted on; the rest are still latched only.
-				 * Gating the measure window on START_MEASURE and parking sensors
-				 * on POWER_OFF is the next step -- a half-wired command that
-				 * silently does nothing is worse than one that visibly does. */
+				/* START_SCAN and ABORT are acted on; gating the measure window on
+				 * START_MEASURE and parking sensors on POWER_OFF is the next step --
+				 * a half-wired command that silently does nothing is worse than one
+				 * that visibly does. */
 				if (cmd == TB_CMD_START_SCAN) {
-					/* Clear the published tag before scanning. Without this the
-					 * previous patient's card is still in the snapshot when the
-					 * ESP32 opens its scanning screen, and the scan "succeeds"
-					 * instantly on a stale identifier -- the worst possible
-					 * failure mode here, since it attaches one patient's
-					 * telemetry to another's ID. */
-					rfid_ascii_len = 0U;
 					rfid_scanning = 1U;
 					rfid_scan_started_ms = HAL_GetTick();
+					/*
+					 * A new patient inherits nothing -- see ForgetPatient().
+					 *
+					 * The tag in particular: without clearing it, the previous
+					 * patient's card is still in the snapshot when the ESP32 opens
+					 * its scanning screen, and the scan "succeeds" instantly on a
+					 * stale identifier. That is the worst failure mode here, since
+					 * it attaches one patient's telemetry to another's ID.
+					 *
+					 * Done here rather than trusting an ABORT to have arrived
+					 * first, so no command ordering can leave anything standing.
+					 */
+					ForgetPatient();
 				} else if (cmd == TB_CMD_ABORT) {
 					rfid_scanning = 0U;
+					/*
+					 * The patient has left the node. This is the other half of the
+					 * bug above and the one that shows up on the dashboard: the
+					 * station publishes a vital for as long as a triage verdict
+					 * stands, so a sticky verdict means this node keeps reporting a
+					 * patient who is gone, every 15 s, with every measurement blank
+					 * because nobody is on the sensors. Those blanks are the newest
+					 * readings the backend has, so they bury the real measurement.
+					 *
+					 * Clearing the verdict makes the station withhold the vital
+					 * entirely (it omits an unscored packet), while node status keeps
+					 * being published every cycle -- so the node stays ONLINE and
+					 * only the patient data stops.
+					 */
+					ForgetPatient();
 				}
 				mon_last_cmd = cmd;
 				++mon_cmds;
@@ -777,15 +858,19 @@ int main(void)
 		{
 			uint8_t prio;
 			uint8_t conf;
-			if (tb_slave_take_result(&prio, &conf)) {
+			uint8_t esi;
+			if (tb_slave_take_result(&prio, &conf, &esi)) {
 				/* Straight onto the LoRa packet: the wire numbering here and at
 				 * TB_REG_PRIORITY are the same LoRa alias, so this is a copy and
 				 * not a conversion. Sticky until the ESP32 scores again, which
 				 * is what the station wants -- a vital arriving between scores
 				 * should carry the standing triage level, not drop back to
-				 * unscored. */
+				 * unscored. The ESI travels with them by construction: the slave
+				 * latched it in the same store as the confidence byte, so the
+				 * score and the colour can only ever come from one model run. */
 				mon_priority = prio;
 				mon_confidence = conf;
+				mon_esi = esi;
 			}
 		}
 
@@ -1120,6 +1205,43 @@ void max30102_plot(uint32_t ir_sample, uint32_t red_sample) {
 /* Respiratory rate as it goes on both wires: the measurement when a mic exists,
  * a hard 0 ("no reading", per tb_regs.h) when one does not. One accessor so the
  * I2C block and the LoRa packet cannot disagree. */
+/*
+ * Drop everything that belongs to one patient.
+ *
+ * Every field here is sticky by design, and each reason is good on its own: a
+ * vital sent between two scores should carry the standing verdict rather than
+ * report "unscored", and the same for the predicted pressure. What was missing is
+ * the event that ends the stickiness. Without it the last patient's verdict stands
+ * until power-off, and since the station publishes a vital for exactly as long as a
+ * verdict stands, the node keeps reporting a patient who has gone -- every 15 s,
+ * with every measurement blank because nobody is on the sensors. Those blanks are
+ * the newest readings the backend holds, so they bury the real measurement.
+ *
+ * Called on START_SCAN (a new patient inherits nothing) and on ABORT (the operator
+ * returned to Home, so this node has no patient). Not from POWER_OFF: the rail is
+ * about to drop and a last honest packet is better than a blanked one.
+ *
+ * The tag goes too, which is what stops a scanning screen from "succeeding"
+ * instantly on the previous card -- the failure that attaches one patient's
+ * telemetry to another's identity.
+ *
+ * mon_confidence follows mon_priority rather than being left alone: a confidence
+ * for a verdict that no longer exists describes nothing, and the station emits the
+ * pair together.
+ */
+static void ForgetPatient(void) {
+	rfid_ascii_len = 0U;
+	mon_priority = LORA_VITAL_PRIORITY_NONE;
+	mon_confidence = 0U;
+	mon_esi = LORA_VITAL_ESI_NONE; /* with the verdict it was scored in, see it */
+	/* Cleared, not just marked invalid: TB_FLAG_BP_VALID gates whether the pair
+	 * is published, but a stale 120/80 sitting in a debugger or an i2creg dump
+	 * next to a fresh patient is its own way to mislead. */
+	mon_bp_valid = 0U;
+	mon_bp_sys = 0U;
+	mon_bp_dia = 0U;
+}
+
 static float ResolvedRespBrpm(void) {
 #if MON_RESP_MIC_FITTED
 	return mon_resp_brpm;
@@ -1128,12 +1250,46 @@ static float ResolvedRespBrpm(void) {
 #endif
 }
 
+/*
+ * The respiratory rate that goes on the LoRa wire and lights TB_FLAG_RR_VALID:
+ * the microphone's measurement when a microphone exists, the operator's typed
+ * value from TB_REG_HOST_RR otherwise, 0 if neither. WHOLE breaths/min, which is
+ * the unit both the packet and the MQTT vital use.
+ *
+ * This exists because the wire was disagreeing with the decision it carried. The
+ * ESP32's tb_classify() REFUSES to score on respiratory_rate <= 0, so every
+ * verdict this node has ever transmitted was computed from the typed value --
+ * while the packet reported no rr at all and the station omitted the key. The
+ * flag is the honest version of that: "this is the RR the verdict came from",
+ * which is all the JSON can express.
+ *
+ * NOT echoed into TB_REG_RR_X10, deliberately. That register stays the
+ * microphone's field and stays 0, so the ESP32's own poll cannot read an
+ * operator's estimate back as a measurement and present it with sensor
+ * provenance. The read-block echo that HOST_BATTERY gets is right for a gauge
+ * and wrong for a human's guess.
+ *
+ * The clamp only guards a future change to the estimator's search range -- it is
+ * bounded well under 255 today -- but the field is one byte, so 255 has to mean
+ * something rather than wrap to 0.
+ */
+static uint8_t WireRespBrpm(void) {
+	float mic = ResolvedRespBrpm();
+
+	if (mic > 254.0f) {
+		return 255U;
+	}
+	if (mic > 0.0f) {
+		return (uint8_t) (mic + 0.5f);
+	}
+	return tb_slave_host_rr(); /* 0 when the ESP32 has none either */
+}
+
 static void PackTelemetry(void) {
-	float brpm = ResolvedRespBrpm();
 	float spo2 = mon_spo2_pct;
 	uint8_t len = rfid_ascii_len;
 
-	mon_lora_vital.node_id = NODE_ID;
+	mon_lora_vital.node_id = mon_node_id;
 	mon_lora_vital.version = LORA_VITAL_VERSION;
 	++mon_lora_vital.packet_counter; /* wraps; the station diffs for loss */
 	mon_lora_vital.flags = mon_flags;
@@ -1146,11 +1302,9 @@ static void PackTelemetry(void) {
 	mon_lora_vital.hr = mon_rate_bpm;
 	mon_lora_vital.spo2 = (uint8_t) ((spo2 > 100.0f) ? 100U :
 										(spo2 > 0.0f) ? (uint8_t) (spo2 + 0.5f) : 0U);
-	/* Whole breaths/min, and clamped because the field is one byte: the resp
-	 * estimator is bounded well below 255 by its own search range, so this only
-	 * guards a future change to that range. */
-	mon_lora_vital.rr = (uint8_t) ((brpm > 254.0f) ? 255U :
-									(brpm > 0.0f) ? (uint8_t) (brpm + 0.5f) : 0U);
+	/* Whole breaths/min: the mic when one exists, else the operator's typed
+	 * value -- WireRespBrpm() owns that choice and its comment owns the why. */
+	mon_lora_vital.rr = WireRespBrpm();
 	/* The ESP32's ML prediction, arriving at TB_REG_HOST_BP_SYS/DIA and taken
 	 * once per superloop pass into these globals -- see the take site. mon_flags
 	 * carries TB_FLAG_BP_VALID from the same pair, so the station never sees a
@@ -1167,6 +1321,21 @@ static void PackTelemetry(void) {
 	/* Whatever the ESP32 last decided, or NONE if it has not decided yet. */
 	mon_lora_vital.priority = mon_priority;
 	mon_lora_vital.confidence = mon_confidence;
+	/* The model's raw 1..5, which the colour cannot carry: tb_classify() collapses
+	 * ESI 3, 4 and 5 all into GREEN, so a walking-wounded 5 and a
+	 * could-deteriorate 3 are indistinguishable by the time they reach here. Taken
+	 * with the verdict, not as state, so it can never belong to a different model
+	 * run than the colour beside it. 0 = unscored, which is the same condition
+	 * that makes priority NONE, so the station is already withholding the vital. */
+	mon_lora_vital.esi = mon_esi;
+	/* The two facts only the operator can supply, straight from the write block.
+	 * Age is in YEARS -- the clinical mid-point of the band the model scored, not
+	 * the band index -- so the station reports the input the verdict came from.
+	 * Gender goes through the helper rather than a cast: 'M'/'F' pass, and
+	 * anything else (including the UI's 'U') becomes 0 so the station omits the
+	 * key instead of publishing an unknown as an answer. */
+	mon_lora_vital.age = tb_slave_host_age();
+	mon_lora_vital.gender = lora_vital_gender_byte((char) tb_slave_host_gender());
 
 	/* The tag as published to the ESP32, so both links name the same patient.
 	 * Clamped rather than trusted: rfid_ascii holds TB_RFID_MAX (31) and this
@@ -1178,6 +1347,94 @@ static void PackTelemetry(void) {
 	mon_lora_vital.victim_rfid_len = len;
 	memset(mon_lora_vital.victim_rfid, 0, sizeof(mon_lora_vital.victim_rfid));
 	memcpy(mon_lora_vital.victim_rfid, rfid_ascii, len);
+}
+
+/* ---- Node identity: the UID -> node_id table ----------------------------- */
+/*
+ * The station polls addresses 1..LORA_POLL_NODE_MAX, so node_id cannot be
+ * derived from the 96-bit factory UID -- it has to be ASSIGNED, and this table is
+ * where. One binary for the whole fleet, looked up at boot; no per-board build
+ * configuration, because that is the step mass production skips.
+ *
+ * TO ADD A BOARD: connect its ESP32 and run the `uid` console command, which
+ * prints this chip's twelve bytes straight off the I2C link (TB_REG_UID). Paste
+ * them in that order, pick the next free id in 1..LORA_POLL_NODE_MAX, reflash.
+ * A serial monitor is the whole toolchain -- no debugger, no SWD probe.
+ *
+ * A UID THAT IS NOT IN THE TABLE RESOLVES TO 0, and 0 means this board keeps its
+ * mouth shut: lora_poll_for_me() never matches a 0 id, so it answers no poll,
+ * TB_SENSOR_LORA stays clear so the ESP32's own status dot shows it, and
+ * mon_node_id is the variable to read over SWD when a freshly flashed board never
+ * appears on the dashboard. The asymmetry is the point -- a silent board is a
+ * one-line diagnosis, while a second board answering as node 1 merges two
+ * patients into one MQTT record and looks like working telemetry.
+ */
+static const struct node_uid {
+	uint8_t uid[TB_REG_UID_LEN]; /**< as the ESP32's `uid` command prints it */
+	uint8_t id;                  /**< poll address, 1..LORA_POLL_NODE_MAX */
+} k_node_uids[] = {
+	/* One row per board, in this shape:
+	 *   { { 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX }, 1U },
+	 * The row is commented out rather than filled with a guess: an invented UID
+	 * committed here would hand a real board somebody else's identity, which is
+	 * the exact failure the table exists to end. */
+	/* { { 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX }, 1U }, */
+	{ { 0U }, 0U }, /* C has no empty initialiser, and this row can only ever
+	                 * resolve to "no address": an all-zero UID is not a chip ST
+	                 * makes, and id 0 is the reserved address. A deliberate no-op
+	                 * -- replace it with the fleet, do not keep it under them. */
+};
+
+/*
+ * This board's address: its table entry if the UID is known, else the -DNODE_ID
+ * it was built with, else 0 for "no address" (see the table).
+ *
+ * THE TABLE WINS over the override, deliberately. A -DNODE_ID left behind in
+ * somebody's build configuration must not be able to move a board the table
+ * already names, because the table is what the fleet's records are keyed on. The
+ * override exists for the board that is not in the table yet, and for that only.
+ *
+ * The bound is the runtime half of what _Static_assert(NODE_ID ...) used to do,
+ * and it is needed for the same two silent failures: id 0 would answer every
+ * node's poll, and an id above the maximum is never polled at all, which is
+ * indistinguishable from a dead radio.
+ *
+ * The table arrives as an argument rather than being read from the global it
+ * always is at runtime, which is what makes the lookup host-testable at all: the
+ * shipped table cannot contain an invented UID, so a hit on a real address can
+ * only be exercised with one the test supplies. See tools/lora_poll_selftest.c.
+ */
+static uint8_t NodeIdFromUid(const uint8_t *uid, const struct node_uid *tab,
+		size_t n) {
+	uint8_t id = (uint8_t) NODE_ID; /* 0 unless the build line said otherwise */
+	size_t i;
+
+	for (i = 0U; i < n; ++i) {
+		if (memcmp(uid, tab[i].uid, TB_REG_UID_LEN) == 0) {
+			id = tab[i].id;
+			break;
+		}
+	}
+	if (id > LORA_POLL_NODE_MAX) {
+		id = 0U; /* a mis-typed table row fails the same way an unknown UID does */
+	}
+	return id;
+}
+
+/* Resolve this board's address from its own UID, once, at boot. UID_BASE is a
+ * read-only factory register, so there is nothing to re-read later.
+ *
+ * These are the same twelve bytes, read the same way, that tb_slave_init()
+ * published at TB_REG_UID -- which is the invariant the whole scheme rests on:
+ * what the ESP32's `uid` command prints has to be what this lookup matches, or
+ * a UID pasted into the table would never hit. Both sides are a memcpy from
+ * UID_BASE for exactly that reason; neither may reorder the bytes. */
+static void ResolveNodeId(void) {
+	uint8_t uid[TB_REG_UID_LEN];
+
+	memcpy(uid, (const void *) UID_BASE, sizeof(uid));
+	mon_node_id = NodeIdFromUid(uid, k_node_uids,
+			sizeof(k_node_uids) / sizeof(k_node_uids[0]));
 }
 
 /* One superloop pass of the LoRa slave side: notice a completed reception and,
@@ -1275,7 +1532,7 @@ static void ServiceLoRaPoll(void) {
 	 * traffic that is not ours is the common case, not an anomaly. A version
 	 * mismatch lands here too -- acting on a packet this node cannot parse is
 	 * worse than dropping it. */
-	if (!lora_poll_for_me((const lora_poll_t *) rx, n, NODE_ID)) {
+	if (!lora_poll_for_me((const lora_poll_t *) rx, n, mon_node_id)) {
 		return;
 	}
 
@@ -1515,8 +1772,24 @@ static void PublishToEsp32(void) {
 		sensors |= TB_SENSOR_MAX30102;
 	}
 	if (ResolvedRespBrpm() > 0.0f) {
-		flags |= TB_FLAG_RR_VALID;
 		sensors |= TB_SENSOR_MIC;
+	}
+	/* A BREATHING RATE EXISTS, from whichever source has one -- the mic if it is
+	 * fitted, otherwise the operator's typed value at TB_REG_HOST_RR. The bit and
+	 * the LoRa rr field are driven from the same WireRespBrpm(), so the station
+	 * cannot see a rate without the bit or a bit without a rate.
+	 *
+	 * TB_SENSOR_MIC stays above with the microphone, NOT here: the sensor byte is
+	 * per-module health and a typed number proves nothing about a mic that is not
+	 * fitted. tb_regs.h's TB_FLAG_RR_VALID comment carries the rest of the
+	 * argument, including how this reverts when the mic PCB ships.
+	 *
+	 * TB_REG_RR_X10 is deliberately left showing the mic's own value (0 today) --
+	 * see WireRespBrpm(). So this flag can be set with that register at 0, which is
+	 * the one asymmetry in the read block and the point of the whole arrangement:
+	 * the ESP32 must not read an operator's estimate back as a measurement. */
+	if (WireRespBrpm() > 0U) {
+		flags |= TB_FLAG_RR_VALID;
 	}
 	/* BP is the ESP32's own ML prediction coming back across the link, not a
 	 * measurement this board takes -- there is no cuff, and PA2 is the breathing
@@ -1531,7 +1804,12 @@ static void PublishToEsp32(void) {
 	if (mon_bp_valid != 0U) {
 		flags |= TB_FLAG_BP_VALID;
 	}
-	if (lora_status == LORA_OK) {
+	/* "LoRa working" means the module answers AND this board has an address on
+	 * the channel. A UID missing from the table resolves to mon_node_id 0, and
+	 * such a board is radios-healthy but cannot appear on the dashboard -- which
+	 * is exactly what the status dot should say, and the one visible trace of a
+	 * provisioning mistake that is otherwise silent by design. */
+	if ((lora_status == LORA_OK) && (mon_node_id != 0U)) {
 		sensors |= TB_SENSOR_LORA;
 	}
 	/* RFID health is "the module answered", not "a card is present": an empty
@@ -1551,6 +1829,11 @@ static void PublishToEsp32(void) {
 
 	tb_slave_publish(flags, mon_buttons, mon_rate_bpm,
 			(uint16_t) (mon_spo2_pct + 0.5f),
+			/* The MICROPHONE's rate only, still 0 today, and deliberately NOT
+			 * WireRespBrpm(): echoing the operator's typed value here would let
+			 * the ESP32 read its own estimate back as a measurement, with the
+			 * provenance of a sensor. tb_regs.h says the same at
+			 * TB_REG_HOST_RR. */
 			(uint16_t) ((ResolvedRespBrpm() * 10.0f) + 0.5f),
 			/* Echoed back, like the battery below and for the same reason:
 			 * TB_REG_BP_SYS/BP_DIA are "the patient's blood pressure" to
