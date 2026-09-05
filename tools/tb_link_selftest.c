@@ -54,23 +54,30 @@ static void test_layout(void)
     assert(offsetof(tb_snapshot_t, rfid_len)  == TB_REG_RFID_LEN);
     assert(offsetof(tb_snapshot_t, rfid)      == TB_REG_RFID);
     assert(offsetof(tb_snapshot_t, lora_rssi) == TB_REG_LORA_RSSI);
+    assert(offsetof(tb_snapshot_t, uid)       == TB_REG_UID);
 
     /* No tail padding: the slave transmits sizeof(tb_snapshot_t) bytes, so any
      * padding would be junk on the wire and would shift TB_REG_SNAPSHOT_END. */
     assert(sizeof(tb_snapshot_t) == TB_REG_SNAPSHOT_END);
-    assert(sizeof(tb_snapshot_t) == 0x31U);
+    assert(sizeof(tb_snapshot_t) == 0x3DU);
 
     /*
-     * lora_rssi sits one byte PAST the vitals block, and that gap is what lets
+     * lora_rssi and the UID sit PAST the vitals block, and that gap is what lets
      * the two boards be flashed independently: the ESP32's 50 ms poll still asks
-     * for exactly TB_REG_READ_END bytes, which is what an STM32 built before this
-     * field served. Fold it inside the block and every poll from a new ESP32 asks
-     * an old slave for one byte more than s_tx holds -- a failed poll, i.e. a
-     * link that looks dead, in exchange for saving one 1-byte read per second.
+     * for exactly TB_REG_READ_END bytes, which is what an STM32 built before
+     * either field served. Fold them inside the block and every poll from a new
+     * ESP32 asks an old slave for more bytes than s_tx holds -- a failed poll,
+     * i.e. a link that looks dead, in exchange for saving a 1-byte read a second.
      */
     assert(TB_REG_READ_END == 0x30U);
     assert(TB_REG_LORA_RSSI == TB_REG_READ_END);
-    assert(TB_REG_SNAPSHOT_END == TB_REG_READ_END + 1U);
+    assert(TB_REG_UID == TB_REG_LORA_RSSI + 1U);
+    assert(TB_REG_UID_LEN == 12U); /* the F411's UID is 96 bits, not 64 or 128 */
+    assert(TB_REG_SNAPSHOT_END == TB_REG_UID + TB_REG_UID_LEN);
+    /* And the UID must be the LAST member, or the slave's staging buffer -- sized
+     * from sizeof(tb_snapshot_t) -- would leave part of it unreadable. */
+    assert(offsetof(tb_snapshot_t, uid) + TB_REG_UID_LEN
+           == sizeof(tb_snapshot_t));
 
     /*
      * Two different bytes mean "no reading", from two different places, so the
@@ -108,13 +115,41 @@ static void test_layout(void)
      * DIA's low byte on SYS's high byte, and the ESP32's four-byte write would
      * then latch a systolic built from half a diastolic. */
     assert(TB_REG_HOST_BP_DIA == TB_REG_HOST_BP_SYS + 2U);
-    assert(TB_REG_WRITE_END == TB_REG_HOST_BP_DIA + 2U);
+    /* The four one-byte host facts, contiguous after the BP pair. Every one is a
+     * separate case in tb_slave.c's write switch, so a register that moved without
+     * its case being moved would land on `default: break` and be silently
+     * ignored -- which is a station omitting rr/age/gender/esi with nothing
+     * anywhere naming why. */
+    assert(TB_REG_HOST_RR == TB_REG_HOST_BP_DIA + 2U);
+    assert(TB_REG_HOST_AGE == TB_REG_HOST_RR + 1U);
+    assert(TB_REG_HOST_GENDER == TB_REG_HOST_AGE + 1U);
+    assert(TB_REG_HOST_ESI == TB_REG_HOST_GENDER + 1U);
+    assert(TB_REG_WRITE_END == TB_REG_HOST_ESI + 1U);
+    assert(TB_REG_WRITE_END == 0x4CU);
+
+    /*
+     * ESI IS NOT ADJACENT TO CONFIDENCE, and that is the whole reason the slave
+     * cannot latch the verdict from one auto-incrementing transaction: the
+     * pointer would have to step backwards from 0x4B to 0x42. So the ESP32 sends
+     * ESI first, in its own transaction, and CONFIDENCE -- written last -- is what
+     * promotes it. Pinned here because if these three ever became contiguous, the
+     * ordering rule in tb_regs.h would silently stop being a constraint.
+     */
+    assert(TB_REG_HOST_ESI > TB_REG_CONFIDENCE + 1U);
 
     /* HOST_BATTERY is written by the master; TB_REG_BATTERY is read by it. Two
      * registers, two directions, one value -- they must not be the same address
      * or the ESP32's write would land on top of what it is about to read. */
     assert(TB_REG_HOST_BATTERY != TB_REG_BATTERY);
     assert(TB_REG_HOST_BATTERY >= TB_REG_CMD);
+
+    /* RR has the same two-register shape and the OPPOSITE rule: HOST_RR is the
+     * inlet, but TB_REG_RR_X10 is NOT its echo -- it stays the microphone's own
+     * field so the ESP32 cannot read an operator's typed estimate back as a
+     * measurement. Different addresses and different units (whole vs tenths), so
+     * neither an alias nor a silent unit slip is possible. */
+    assert(TB_REG_HOST_RR != TB_REG_RR_X10);
+    assert(TB_REG_HOST_RR >= TB_REG_CMD);
 
     /* Same rule for the BP pair, which has the same shape: the ESP32 writes its
      * prediction at HOST_BP_* and reads the echo back at BP_*. These four
@@ -506,15 +541,30 @@ static void test_lora_vital_layout(void)
     assert(offsetof(lora_vital_t, battery)         == 14U);
     assert(offsetof(lora_vital_t, priority)        == 15U);
     assert(offsetof(lora_vital_t, confidence)      == 16U);
-    assert(offsetof(lora_vital_t, victim_rfid_len) == 17U);
-    assert(offsetof(lora_vital_t, victim_rfid)     == 18U);
+    assert(offsetof(lora_vital_t, esi)             == 17U);
+    assert(offsetof(lora_vital_t, age)             == 18U);
+    assert(offsetof(lora_vital_t, gender)          == 19U);
+    assert(offsetof(lora_vital_t, victim_rfid_len) == 20U);
+    assert(offsetof(lora_vital_t, victim_rfid)     == 21U);
 
     /* LORA_VITAL_FIXED_LEN is what lora_vital_len() adds the tag length to. If
      * a field is ever inserted, this is the assert that catches the constant not
      * following it -- otherwise every packet would be short by the difference
-     * and the tag would arrive truncated. */
+     * and the tag would arrive truncated. 0x02 appended three bytes, so the
+     * number itself is pinned as well as its relation to the struct. */
     assert(offsetof(lora_vital_t, victim_rfid) == LORA_VITAL_FIXED_LEN);
+    assert(LORA_VITAL_FIXED_LEN == 21U);
     assert(sizeof(lora_vital_t) == LORA_VITAL_FIXED_LEN + LORA_VITAL_RFID_MAX);
+    assert(sizeof(lora_vital_t) == 41U);
+
+    /* Every uint16_t still at an even offset after the three new bytes -- the
+     * station casts this struct over the received frame, so an odd u16 is an
+     * unaligned load there rather than a compile error here. The three appended
+     * fields are all u8, which is why they could go at the end at all. */
+    assert((offsetof(lora_vital_t, packet_counter) % 2U) == 0U);
+    assert((offsetof(lora_vital_t, hr) % 2U) == 0U);
+    assert((offsetof(lora_vital_t, bp_sys) % 2U) == 0U);
+    assert((offsetof(lora_vital_t, bp_dia) % 2U) == 0U);
 
     /* Must fit one SX1278 explicit-header packet; LoRa_transmit takes a uint8_t
      * length, so anything over 255 would silently wrap. */
@@ -612,6 +662,38 @@ static void test_lora_vital_valid(void)
      * sentinels are the same byte: 0xFF at both ends, and never 0. */
     assert(LORA_VITAL_BATTERY_NONE == 0xFFU);
     assert(LORA_VITAL_BATTERY_NONE != 0U);
+
+    /* esi/age/gender go the other way and all three use 0, because for these 0
+     * cannot be a reading: the ESI scale starts at 1, no patient is 0 years old,
+     * and 0 is not an ASCII letter. The station must omit the key rather than
+     * publish the zero -- a 0 age reads as a newborn. */
+    assert(LORA_VITAL_ESI_NONE == 0U);
+    assert(LORA_VITAL_AGE_NONE == 0U);
+    assert(LORA_VITAL_GENDER_NONE == 0U);
+
+    /* The version had to move for those three, unlike tb_regs.h's read block:
+     * the packet GREW, so an 0x01 station casting an 0x02 frame would read the
+     * tag length out of the gender byte. This is the check that keeps the STM32
+     * and the station flashed together. */
+    assert(LORA_VITAL_VERSION == 0x02U);
+}
+
+/* Gender is the only field on this packet that is converted rather than copied,
+ * and the conversion is where an unknown answer must stop being an answer. */
+static void test_lora_vital_gender(void)
+{
+    assert(lora_vital_gender_byte('M') == (uint8_t)'M');
+    assert(lora_vital_gender_byte('F') == (uint8_t)'F');
+
+    /* 'U' is a real value in the ESP32's UI and must NOT reach the wire as one:
+     * the station has no "unknown" gender, so it would publish "U" as if the
+     * operator had answered it. Everything that is not M or F folds to the
+     * omit-the-key sentinel. */
+    assert(lora_vital_gender_byte('U') == LORA_VITAL_GENDER_NONE);
+    assert(lora_vital_gender_byte(0) == LORA_VITAL_GENDER_NONE);
+    assert(lora_vital_gender_byte('m') == LORA_VITAL_GENDER_NONE); /* case matters */
+    assert(lora_vital_gender_byte('f') == LORA_VITAL_GENDER_NONE);
+    assert(lora_vital_gender_byte('?') == LORA_VITAL_GENDER_NONE);
 }
 
 /* ---- The poll filter: the node's only defence against answering wrongly --- */
@@ -976,6 +1058,7 @@ int main(void)
     test_lora_vital_len();
     test_lora_vital_priority();
     test_lora_vital_valid();
+    test_lora_vital_gender();
     test_poll_for_me();
     test_button_polarity();
     test_button_debounce();

@@ -105,8 +105,16 @@ uint8_t tb_slave_take_cmd(void);
  * Latest triage result written by the ESP32. Returns false if none has arrived
  * since the last call. `priority` is in LoRa order (0=BLACK 1=RED 2=YELLOW
  * 3=GREEN) -- that is what the LoRa packet wants, so pass it through unchanged.
+ * `esi` is the model's raw 1..5 that arrived with it (TB_REG_HOST_ESI), 0 if
+ * the model did not score.
+ *
+ * ESI is taken HERE and not as state because it is part of the verdict: the
+ * ESP32 writes it before TB_REG_CONFIDENCE, and the confidence byte latches
+ * the pair complete. The slave copies it into the believed value at that
+ * instant, so a take can never publish the previous patient's ESI beside this
+ * patient's colour -- the one pairing mistake downstream cannot undo.
  */
-bool tb_slave_take_result(uint8_t *priority, uint8_t *confidence);
+bool tb_slave_take_result(uint8_t *priority, uint8_t *confidence, uint8_t *esi);
 
 /*
  * Latest blood pressure the ESP32's model wrote, in mmHg. Returns false if no
@@ -132,6 +140,21 @@ bool tb_slave_take_bp(uint16_t *sys, uint16_t *dia);
  * key for 0xFF and reports a flat pack for 0.
  */
 uint8_t tb_slave_host_battery(void);
+
+/*
+ * The operator-typed patient facts that arrived backwards over this link:
+ * breaths/min (whole, 0 = none), age in years (0 = not asked), and gender as the
+ * raw ASCII byte the ESP32 wrote ('M'/'F', 0 = not asked). STATE, like
+ * tb_slave_host_battery() -- these describe the patient for the whole session,
+ * so call them as often as you like and nothing is drained.
+ *
+ * Use lora_vital_gender_byte() when stamping gender into the packet; the raw
+ * byte passes through unconverted here so a bad value stays diagnosable on the
+ * I2C link rather than silently becoming "not asked" in two places at once.
+ */
+uint8_t tb_slave_host_rr(void);
+uint8_t tb_slave_host_age(void);
+uint8_t tb_slave_host_gender(void);
 
 /* Diagnostics for CubeMonitor / a status register later. */
 extern volatile uint32_t mon_i2c_reads;   /**< completed master reads */
