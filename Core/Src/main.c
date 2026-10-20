@@ -135,6 +135,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static volatile uint16_t mon_adc_min = 0;
+static volatile uint16_t mon_adc_max = 4096;
 // LoRa
 LoRa hlora;
 
@@ -463,7 +465,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-   HAL_Init();
+  HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -572,6 +574,9 @@ int main(void)
 	tb_buttons_init(&btn_state);
 	tb_slave_init();
 	PublishToEsp32();
+
+	mon_adc_min = 0;
+	mon_adc_max = 4096;
   /* USER CODE END 2 */
 
   /* Infinite loop */
