@@ -124,8 +124,9 @@ static void test_layout(void)
     assert(TB_REG_HOST_AGE == TB_REG_HOST_RR + 1U);
     assert(TB_REG_HOST_GENDER == TB_REG_HOST_AGE + 1U);
     assert(TB_REG_HOST_ESI == TB_REG_HOST_GENDER + 1U);
-    assert(TB_REG_WRITE_END == TB_REG_HOST_ESI + 1U);
-    assert(TB_REG_WRITE_END == 0x4CU);
+    assert(TB_REG_HOST_NODE_ID == TB_REG_HOST_ESI + 1U);
+    assert(TB_REG_WRITE_END == TB_REG_HOST_NODE_ID + 1U);
+    assert(TB_REG_WRITE_END == 0x4DU);
 
     /*
      * ESI IS NOT ADJACENT TO CONFIDENCE, and that is the whole reason the slave

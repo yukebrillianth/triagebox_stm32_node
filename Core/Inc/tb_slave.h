@@ -154,6 +154,9 @@ uint8_t tb_slave_host_battery(void);
  */
 uint8_t tb_slave_host_rr(void);
 uint8_t tb_slave_host_age(void);
+/* The poll address the operator set in the ESP32's Menu, 0 until it has written
+ * one. Range is NOT checked here -- see ApplyHostNodeId() in main.c. */
+uint8_t tb_slave_host_node_id(void);
 uint8_t tb_slave_host_gender(void);
 
 /* Diagnostics for CubeMonitor / a status register later. */

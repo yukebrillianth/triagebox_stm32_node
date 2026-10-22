@@ -98,6 +98,9 @@
 // board, no per-board configuration. NodeIdFromUid() is the whole mechanism and
 // the comment there is the instructions for adding a board.
 //
+// PRECEDENCE, highest first: the address set in the ESP32's Menu (TB_REG_HOST_NODE_ID,
+// see ResolveHostNodeId), then the UID table, then -DNODE_ID, then 0 = silent.
+//
 // This define survives as the ESCAPE HATCH for a board that is not in the table
 // yet: -DNODE_ID=2 still works and the table still wins over it when it matches.
 // It defaults to 0 rather than 1, and 0 means "this board has no address": it
@@ -499,6 +502,7 @@ static void PublishToEsp32(void);
 static void ServiceRfid(void);
 static void ServiceLoRaPoll(void);
 static void ForgetPatient(void);
+static uint8_t ResolveHostNodeId(uint8_t host, uint8_t current);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -770,6 +774,7 @@ int main(void)
 		}
 
 		/* ---- LoRa: answer the station if it asked ---- */
+		mon_node_id = ResolveHostNodeId(tb_slave_host_node_id(), mon_node_id);
 		ServiceLoRaPoll();
 
 		// Prefer the interrupt path, but fall back to polling if the edge never arrives
@@ -1413,6 +1418,23 @@ static uint8_t NodeIdFromUid(const uint8_t *uid, const struct node_uid *tab,
 	}
 	return id;
 }
+
+/*
+ * The poll address chosen in the ESP32's Menu wins over the UID table and over
+ * -DNODE_ID: it is the operator's explicit, current choice, and the ESP32
+ * re-sends it every few seconds from its own persistent store, so a board that
+ * reset comes back on the same address without anyone touching it.
+ *
+ * An out-of-range byte (0 = never written, or above the maximum) is IGNORED and
+ * the current address kept: applying it would turn one bad byte into a node that
+ * is never polled, which looks exactly like a dead radio. Changing the address
+ * while a reply is in flight is harmless -- mon_node_id is one byte, read once
+ * per poll and once per packet build.
+ */
+static uint8_t ResolveHostNodeId(uint8_t host, uint8_t current) {
+	return ((host >= 1U) && (host <= LORA_POLL_NODE_MAX)) ? host : current;
+}
+/* ---- end of the host-testable node identity ---- */
 
 /* Resolve this board's address from its own UID, once, at boot. UID_BASE is a
  * read-only factory register, so there is nothing to re-read later.

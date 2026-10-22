@@ -244,6 +244,7 @@ static volatile uint8_t s_host_battery = 0xFFU;
  */
 static volatile uint8_t s_host_rr;
 static volatile uint8_t s_host_age;
+static volatile uint8_t s_host_node_id;
 static volatile uint8_t s_host_gender;
 
 static void arm_receive(void)
@@ -569,6 +570,11 @@ uint8_t tb_slave_host_rr(void)
     return s_host_rr;
 }
 
+uint8_t tb_slave_host_node_id(void)
+{
+    return s_host_node_id;
+}
+
 uint8_t tb_slave_host_age(void)
 {
     return s_host_age;
@@ -719,6 +725,11 @@ void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c)
             break;
         case TB_REG_HOST_GENDER:
             s_host_gender = byte;
+            break;
+        case TB_REG_HOST_NODE_ID:
+            /* Stored raw; main.c range-checks it against LORA_POLL_NODE_MAX, which
+             * this file has no business knowing. */
+            s_host_node_id = byte;
             break;
         case TB_REG_HOST_ESI:
             /* NOT believed here -- see s_esi_wr. It is written in its own

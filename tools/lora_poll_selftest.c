@@ -476,6 +476,15 @@ int main(void)
 	assert(mon_lora_polls == 0U && tx_count == 0U);
 	mon_node_id = 1U;
 
-	printf("lora_poll_selftest: OK (ServiceLoRaPoll, NodeIdFromUid)\n");
+	/* The Menu's address wins when valid, and is ignored (current kept) when 0 or
+	 * above the maximum -- one bad byte must not silence a working node. */
+	assert(ResolveHostNodeId(5U, 1U) == 5U);
+	assert(ResolveHostNodeId(1U, 0U) == 1U);
+	assert(ResolveHostNodeId(LORA_POLL_NODE_MAX, 3U) == LORA_POLL_NODE_MAX);
+	assert(ResolveHostNodeId(0U, 3U) == 3U);
+	assert(ResolveHostNodeId(LORA_POLL_NODE_MAX + 1U, 3U) == 3U);
+	assert(ResolveHostNodeId(0xFFU, 3U) == 3U);
+
+	printf("lora_poll_selftest: OK (ServiceLoRaPoll, NodeIdFromUid, ResolveHostNodeId)\n");
 	return 0;
 }
