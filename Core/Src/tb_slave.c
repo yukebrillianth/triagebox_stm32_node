@@ -30,7 +30,7 @@ volatile uint32_t mon_bp_writes_rejected = 0;
  * exists to win. The ESP32 reaches its GT911 read -- the first thing that dies
  * on a held bus -- 1333 ms after its own reset, measured. A wedge that starts
  * when the ESP32 resets mid-transfer therefore had 333 ms of margin, and the
- * superloop can be delayed by the 497.5 Hz ADC ISR and by a LoRa transmit, so
+ * superloop can be delayed by the 500 Hz ADC ISR and by a LoRa transmit, so
  * that margin was routinely gone. At 200 ms the bus is free ~1.1 s before the
  * ESP32 looks at it. The floor is a whole transaction: 13 ms. */
 #define TB_SLAVE_STUCK_MS 200U
@@ -186,6 +186,22 @@ static volatile uint8_t s_rx;          /* one-byte landing pad for writes */
 static volatile uint8_t s_cmd = TB_CMD_NONE;
 static volatile uint8_t s_priority;
 static volatile uint8_t s_confidence;
+/*
+ * The model's raw ESI, 1..5, or 0 for "it did not score". Two variables for the
+ * same reason the BP pair below has two: TB_REG_HOST_ESI is not adjacent to
+ * PRIORITY/CONFIDENCE, so the register pointer cannot auto-increment across them
+ * and the ESP32 must send TWO transactions -- ESI first, then the pair. s_esi_wr
+ * is the half-assembled verdict; s_esi is what a reader may believe, copied
+ * across when CONFIDENCE latches the set complete.
+ *
+ * Latching in place would leave exactly the window this exists to close: a
+ * verdict standing unread, the next verdict's ESI arriving, and the take then
+ * handing out the old colour beside the new score. That pairing is not
+ * recoverable downstream -- the station publishes both and nothing says they came
+ * from different runs.
+ */
+static volatile uint8_t s_esi_wr;
+static volatile uint8_t s_esi;
 static volatile bool s_result_fresh = false;
 
 /*
@@ -209,6 +225,27 @@ static volatile bool s_bp_fresh = false;
  * TB_REG_HOST_BATTERY. Not a "take": this is state like the button bitmask, so a
  * read that misses an update costs nothing and there is nothing to drain. */
 static volatile uint8_t s_host_battery = 0xFFU;
+
+/*
+ * The three patient facts only the operator knows: whole breaths/min, years, and
+ * the ASCII gender byte. STATE, not takes, like the battery above -- they
+ * describe the patient for the whole session rather than an event, so a read
+ * that misses an update costs nothing and there is nothing to drain.
+ *
+ * 0 means "not supplied" for all three, and 0 is safe for all three -- see
+ * TB_REG_HOST_RR for the argument (the ESI scale starts at 1, no patient is 0
+ * years old, 0 is not an ASCII letter).
+ *
+ * ponytail: nothing clears these on a patient change, unlike the verdict, so a
+ * second patient whose Age screen is skipped inherits the first one's age. The
+ * ESP32 walks those screens per session today, so it always rewrites them.
+ * Upgrade path if a screen ever becomes skippable: a tb_slave_forget_host()
+ * zeroing all three, called from main.c's ForgetPatient().
+ */
+static volatile uint8_t s_host_rr;
+static volatile uint8_t s_host_age;
+static volatile uint8_t s_host_node_id;
+static volatile uint8_t s_host_gender;
 
 static void arm_receive(void)
 {
@@ -253,6 +290,12 @@ void tb_slave_init(void)
     memset(&s_stage, 0, sizeof(s_stage));
     s_stage.proto_ver = TB_PROTO_VER;
     s_stage.battery = 0xFFU; /* not measured */
+    /* The factory UID: constant for the life of the chip, so it is read here,
+     * once -- tb_slave_publish() never touches s_stage.uid, which is how "read
+     * once, not per publish" is enforced by construction rather than by comment.
+     * The struct is packed and this is the LAST member, so the memcpy cannot
+     * shift anything above it. */
+    memcpy(s_stage.uid, (const void *) UID_BASE, TB_REG_UID_LEN);
 
     memcpy((void *)&s_live, &s_stage, sizeof(s_stage));
     memcpy(s_tx, &s_stage, sizeof(s_stage));
@@ -270,7 +313,7 @@ void tb_slave_init(void)
     hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
     /*
      * Clock stretching MUST stay enabled (NoStretch DISABLE). This slave is
-     * behind a priority-0 ADC ISR at 497.5 Hz, so an address match can wait a
+     * behind a priority-0 ADC ISR at 500 Hz, so an address match can wait a
      * few microseconds before we service it; with stretching off that becomes
      * corrupt data instead of a brief delay.
      */
@@ -287,7 +330,7 @@ void tb_slave_init(void)
      * disable them in between; that is fine, nothing is listening yet.)
      *
      * Both sit at preempt priority 0, like every other interrupt in this
-     * firmware, so this cannot preempt the 497.5 Hz ADC ISR and can be delayed
+     * firmware, so this cannot preempt the 500 Hz ADC ISR and can be delayed
      * by it by a few microseconds. That is exactly why the transmit buffer is
      * pre-staged: the delay costs a little clock stretching, never wrong data.
      */
@@ -480,24 +523,66 @@ uint8_t tb_slave_take_cmd(void)
     return cmd;
 }
 
-bool tb_slave_take_result(uint8_t *priority, uint8_t *confidence)
+/*
+ * The verdict, and it is now a TRIPLE rather than two independent bytes, which is
+ * why it borrows tb_slave_take_bp()'s critical section.
+ *
+ * Priority and confidence tearing apart costs a slightly stale confidence on the
+ * right triage level. ESI is not like that: tb_classify() collapses ESI 3/4/5
+ * into GREEN, so the score carries information the colour cannot, and an
+ * interrupt landing between these loads would publish one model run's colour
+ * beside another's score with nothing downstream able to tell. Same masking rule
+ * as everywhere else in this file -- only I2C2_EV_IRQn, so the ADC/DMA ISR keeps
+ * running and the ECG window loses no samples.
+ */
+bool tb_slave_take_result(uint8_t *priority, uint8_t *confidence, uint8_t *esi)
 {
-    if (!s_result_fresh) {
-        return false;
+    bool fresh;
+
+    HAL_NVIC_DisableIRQ(I2C2_EV_IRQn);
+    fresh = s_result_fresh;
+    if (fresh) {
+        if (priority != NULL) {
+            *priority = s_priority;
+        }
+        if (confidence != NULL) {
+            *confidence = s_confidence;
+        }
+        if (esi != NULL) {
+            *esi = s_esi;
+        }
+        s_result_fresh = false;
     }
-    if (priority != NULL) {
-        *priority = s_priority;
-    }
-    if (confidence != NULL) {
-        *confidence = s_confidence;
-    }
-    s_result_fresh = false;
-    return true;
+    HAL_NVIC_EnableIRQ(I2C2_EV_IRQn);
+
+    return fresh;
 }
 
 uint8_t tb_slave_host_battery(void)
 {
     return s_host_battery;
+}
+
+/* Plain state reads, like the battery above: one byte each, no critical section
+ * needed and nothing to drain. See the statics for why these are not takes. */
+uint8_t tb_slave_host_rr(void)
+{
+    return s_host_rr;
+}
+
+uint8_t tb_slave_host_node_id(void)
+{
+    return s_host_node_id;
+}
+
+uint8_t tb_slave_host_age(void)
+{
+    return s_host_age;
+}
+
+uint8_t tb_slave_host_gender(void)
+{
+    return s_host_gender;
 }
 
 /*
@@ -597,8 +682,8 @@ void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c)
         s_ptr = byte;
         s_ptr_valid = true;
     } else {
-        /* A data byte written to the current pointer. Only the command block
-         * is writable; everything else is read-only by design, so a stray
+        /* A data byte written to the current pointer. Only the write block
+         * below is writable; everything else is read-only by design, so a stray
          * write cannot corrupt sensor readings. */
         switch (s_ptr) {
         case TB_REG_CMD:
@@ -609,7 +694,14 @@ void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c)
             break;
         case TB_REG_CONFIDENCE:
             s_confidence = byte;
-            /* Confidence is written last, so the pair is complete here. */
+            /* Confidence is written last, so the pair is complete here -- and
+             * ESI, which is not adjacent to this register, had to arrive in its
+             * own transaction earlier. Promote it in the same store, so the
+             * take can never hand out one model run's colour beside another's
+             * score: tb_classify() collapses ESI 3/4/5 into GREEN, so the score
+             * carries what the colour cannot and the mismatch is not even
+             * visible downstream. */
+            s_esi = s_esi_wr;
             s_result_fresh = true;
             break;
         case TB_REG_HOST_BATTERY:
@@ -617,6 +709,33 @@ void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c)
              * could not read the gauge, and passing it through unchanged is what
              * makes the station omit the key instead of reporting a flat pack. */
             s_host_battery = byte;
+            break;
+        /*
+         * The three operator-typed patient facts, one byte each. Plain state
+         * stores, exactly like HOST_BATTERY above -- see the statics for why
+         * these are not takes. Values pass through unvalidated, matching
+         * HOST_BATTERY and PRIORITY: the slave cannot tell a plausible age from
+         * an implausible one, and the ESP32's own screen bounds what it sends.
+         */
+        case TB_REG_HOST_RR:
+            s_host_rr = byte;
+            break;
+        case TB_REG_HOST_AGE:
+            s_host_age = byte;
+            break;
+        case TB_REG_HOST_GENDER:
+            s_host_gender = byte;
+            break;
+        case TB_REG_HOST_NODE_ID:
+            /* Stored raw; main.c range-checks it against LORA_POLL_NODE_MAX, which
+             * this file has no business knowing. */
+            s_host_node_id = byte;
+            break;
+        case TB_REG_HOST_ESI:
+            /* NOT believed here -- see s_esi_wr. It is written in its own
+             * transaction before the pair, so it waits with the half-assembled
+             * verdict until CONFIDENCE latches. */
+            s_esi_wr = byte;
             break;
         /*
          * Blood pressure from the ESP32's model: two little-endian u16s, so four

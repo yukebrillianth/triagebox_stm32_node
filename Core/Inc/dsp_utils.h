@@ -15,24 +15,17 @@
 #include "arm_math.h"
 
 /* ---- Sample rates (Hz) -------------------------------------------------- */
-/* TIM2: 100MHz timer clock / (999+1) / (200+1) = 497.5Hz, both ADC ranks.
+/* TIM2: 100MHz timer clock / (999+1) / (199+1) = 500Hz exactly, both ADC ranks.
+ * (ARR was 200 until 2026-10-20, which gave 497.5Hz; see DSP_ADC_FS_TRUE_HZ.)
  *
- * Two constants for one rate, deliberately. This integer one sizes buffers and
- * derives sample counts, where being 0.5% off is invisible and an integer keeps
- * the arithmetic exact. Anything that converts a sample COUNT into a real-world
- * RATE must use DSP_ADC_FS_TRUE_HZ instead, or the answer is 0.5% high. */
+ * Two names for one rate. DSP_ADC_FS_HZ sizes buffers and derives sample counts;
+ * DSP_ADC_FS_TRUE_HZ is for converting a sample COUNT into a real-world RATE.
+ * They are equal now, but a prescaler/ARR change in the .ioc makes them differ
+ * again, and nothing ties either to the timer registers -- so the derivation is
+ * spelled out here, and the two are kept separate for that day. */
 #define DSP_ADC_FS_HZ 500u
-/*
- * The rate the hardware actually produces: 100000000 / 1000 / 201 = 497.5124 Hz.
- * Verified against the counter, 498.0-498.5 samples/s measured over SWD.
- *
- * Every published bpm read 0.50% high until 2026-08-30 because the bpm divide used
- * the integer above -- a true 60.0 printed as 60.3. Small, but it is a measurement
- * error with a known sign, and free to remove. Note that nothing ties either
- * constant to the timer registers, so a prescaler change in the .ioc silently
- * invalidates both; the derivation is spelled out here for that reason.
- */
-#define DSP_ADC_FS_TRUE_HZ 497.5124f
+/* The rate the hardware produces: 100000000 / 1000 / 200 = 500.0 Hz. */
+#define DSP_ADC_FS_TRUE_HZ 500.0f
 /* MAX30102 at sr_800 with smp_ave_8 averages down to ~100Hz output. */
 #define DSP_PPG_FS_HZ 100u
 

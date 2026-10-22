@@ -33,7 +33,13 @@
 
 #define PN532_CMD_GET_FIRMWARE_VERSION 0x02u
 #define PN532_CMD_SAM_CONFIGURATION 0x14u
+#define PN532_CMD_RF_CONFIGURATION 0x32u
 #define PN532_CMD_IN_LIST_PASSIVE_TARGET 0x4Au
+
+/* RFConfiguration CfgItem 5 = MaxRetries {MxRtyATR, MxRtyPSL,
+ * MxRtyPassiveActivation}. See Handshake() for why the last one is 1 and not
+ * the module's default 0xFF. */
+#define PN532_CFG_MAX_RETRIES 0x05u
 
 /* 106 kbps type A, the mode every Mifare Classic and NTAG tag answers. */
 #define PN532_BRTY_ISO14443A 0x00u
@@ -281,6 +287,33 @@ static uint8_t ParseHeader(const uint8_t *f, uint8_t f_len, uint8_t *payload_at)
 }
 
 /**
+ * Discards one frame the module is already holding, if any.
+ *
+ * Costs one status-byte read when nothing is pending, which is the normal case.
+ * It exists because a desync is SILENT AND STICKY: if a response is ever left
+ * unread, the next scan's ReadAck() consumes it instead of the ACK and every
+ * read after that is one frame behind for the rest of the 30 s scan window --
+ * a card that reads instantly one moment and not at all the next, with no
+ * wiring difference. The MaxRetries setting in Handshake() removes the known
+ * cause; this makes any remaining cause self-healing rather than permanent.
+ */
+static void DrainPending(void)
+{
+	uint8_t st = 0;
+
+	if (HAL_I2C_Master_Receive(pn_bus, PN532_I2C_ADDR, &st, 1U,
+			PN532_I2C_TIMEOUT) != HAL_OK) {
+		return;
+	}
+	if ((st & 0x01u) == 0U) {
+		return; /* nothing waiting, which is what a healthy scan looks like */
+	}
+	uint8_t junk[PN532_RX_MAX];
+	(void) HAL_I2C_Master_Receive(pn_bus, PN532_I2C_ADDR, junk, sizeof(junk),
+			PN532_I2C_TIMEOUT);
+}
+
+/**
  * Address-phase-only check: does anything at 0x24 ACK?
  *
  * Worth separating from the handshake because the two failures look identical
@@ -349,6 +382,47 @@ static uint8_t Handshake(void)
 	if (sam_rx[at] != (PN532_CMD_SAM_CONFIGURATION + 1U)) {
 		return 0;
 	}
+
+	/*
+	 * MxRtyPassiveActivation = 1, and this is the fix for "sometimes the card is
+	 * not detected".
+	 *
+	 * The module's default is 0xFF, which the user manual defines as RETRY
+	 * FOREVER: InListPassiveTarget with no card in the field never answers at
+	 * all. ReadFrame then gives up after PN532_READY_TIMEOUT and this driver
+	 * reports NO_CARD -- correct as an answer, but THE MODULE IS STILL RUNNING
+	 * THAT COMMAND. ServiceRfid() calls back one superloop pass later, sends a
+	 * fresh InListPassiveTarget, and the module's eventual reply to the FIRST one
+	 * arrives where the second one's ACK was expected. From there every read is
+	 * one frame behind: ReadAck() sees a response instead of an ACK, the scan
+	 * fails, and the desync persists for the rest of the 30 s window. That is
+	 * exactly the reported symptom -- a card that reads instantly sometimes and
+	 * not at all other times, with no wiring difference.
+	 *
+	 * With one retry the module always answers within ~50 ms (NbTg = 0 when the
+	 * field is empty), so every command gets exactly one response and the frame
+	 * stream cannot drift. The retry loop that matters is ServiceRfid()'s own
+	 * 30 s window, which re-sends the command each pass anyway -- so nothing is
+	 * lost; the retrying just moves to where it can be bounded and observed.
+	 *
+	 * ATR and PSL retries are left at their defaults (0xFF): they apply to
+	 * activation steps this driver never reaches, and changing what is not
+	 * understood is how a working handshake breaks.
+	 *
+	 * Not fatal if it fails. A module that answers GetFirmwareVersion and
+	 * SAMConfiguration but rejects this is still usable at the old behaviour, and
+	 * refusing to scan at all would be strictly worse than scanning imperfectly.
+	 */
+	{
+		const uint8_t cfg[5] = { PN532_CMD_RF_CONFIGURATION,
+				PN532_CFG_MAX_RETRIES, 0xFFu, 0xFFu, 0x01u };
+		uint8_t cfg_rx[12];
+
+		if (SendFrame(cfg, sizeof(cfg)) && ReadAck()) {
+			(void) ReadFrame(cfg_rx, sizeof(cfg_rx), PN532_READY_TIMEOUT);
+		}
+	}
+
 	pn_stage = PN532_STAGE_READY;
 	return 1;
 }
@@ -388,6 +462,12 @@ uint8_t Pn532_Service(Pn532_Tag *out)
 		}
 		pn_configured = 1;
 	}
+
+	/*
+	 * Anything the module is still holding is dropped before asking again --
+	 * see DrainPending(). One status read in the common case.
+	 */
+	DrainPending();
 
 	/* InListPassiveTarget, MaxTg = 1: stop at the first tag. Scanning for two
 	 * doubles the worst-case blocking time for no benefit when one patient

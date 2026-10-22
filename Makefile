@@ -37,7 +37,24 @@ INCLUDES := -ICore/Inc \
             -IMiddlewares/ST/ARM/DSP/Inc \
             -ILoRa -IMAX30102
 
-CFLAGS  := $(MCU) -DDEBUG -DUSE_HAL_DRIVER -DSTM32F411xE $(INCLUDES) \
+# Bench override for a board whose UID is not in k_node_uids yet:
+#
+#     make NODE_ID=1
+#
+# main.c documents -DNODE_ID as the escape hatch, but until this variable existed
+# there was no way to pass it -- `make CFLAGS_EXTRA=-DNODE_ID=1` and every other
+# guess compiled cleanly and produced a node 0 binary, silently. That is the same
+# shape as the original bug (a NODE_ID nothing ever defined), so the hatch is
+# spelled out here rather than left to the caller to discover.
+#
+# Empty by default: a normal build resolves its id from the UID table, and a
+# default here would hand every board the same address again.
+NODE_ID ?=
+ifneq ($(NODE_ID),)
+EXTRA_DEFS := -DNODE_ID=$(NODE_ID)
+endif
+
+CFLAGS  := $(MCU) -DDEBUG -DUSE_HAL_DRIVER -DSTM32F411xE $(EXTRA_DEFS) $(INCLUDES) \
            -Os -g3 -Wall -ffunction-sections -fdata-sections -MMD -MP
 LDFLAGS := $(MCU) -T STM32F411CEUX_FLASH.ld \
            --specs=nano.specs --specs=nosys.specs \
