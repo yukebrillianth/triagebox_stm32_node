@@ -67,10 +67,10 @@
 #define MIC_ADC_INDEX 1u
 #define ANALOG_CHANNEL_COUNT 2u
 // How many raw ADC samples the boxcar in HAL_ADC_ConvCpltCallback averages into
-// one ECG value for the ESP32's waveform block. 497.5Hz / 5 = 99.5Hz, i.e. one
+// one ECG value for the ESP32's waveform block. 500Hz / 5 = 100Hz, i.e. exactly one
 // per PPG sample at TB_PPG_FS_HZ; the static assert next to max30102_plot proves
 // the two still line up. Nothing else may use this rate - the STM32's own ECG
-// window keeps the full 497.5Hz stream.
+// window keeps the full 500Hz stream.
 #define ECG_WAVE_DECIM 5u
 // ECG window: DSP_ECG_WINDOW samples at DSP_ADC_FS_HZ = 6.03s, enough for 4-6
 // beats and so 3-5 R-R intervals to take a median over.
@@ -217,7 +217,7 @@ static volatile uint8_t ecg_ready_bank = 0xFF; /* 0xFF = none pending */
 volatile uint16_t mon_ecg_raw = 0; /**< 500Hz raw ECG sample, ADC LSB */
 volatile uint16_t mon_mic_raw = 0; /**< 500Hz raw mic sample, ADC LSB */
 /* The ECG as the ESP32 gets it: mon_ecg_raw averaged over 5 consecutive samples,
- * so 497.5/5 = 99.5 Hz -- one value per PPG sample, which is what lets the two
+ * so 500/5 = 100 Hz -- one value per PPG sample, which is what lets the two
  * share a slot in the waveform block. Still raw ADC counts, not filtered: the
  * boxcar is a decimation anti-alias, and everything the BP model wants from this
  * channel (the R peak's position) survives it. Watch it against mon_ecg_raw; the
@@ -970,30 +970,21 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 	/* ---- ECG for the ESP32: 5-sample boxcar, staged for the waveform ring ----
 	 *
 	 * The waveform block carries one ECG value per PPG sample, and the two
-	 * sources run at different rates: this ADC at DSP_ADC_FS_TRUE_HZ = 497.5 Hz
-	 * (TIM2's real rate, not the integer DSP_ADC_FS_HZ used for sizing buffers),
-	 * the MAX30102 at DSP_PPG_FS_HZ = 100 Hz. Five raw samples per staged value
-	 * brings the ECG to 99.5 Hz, which is the closest integer ratio there is.
+	 * sources run at different rates: this ADC at DSP_ADC_FS_TRUE_HZ = 500 Hz
+	 * (TIM2: 100 MHz / 1000 / 200), the MAX30102 at DSP_PPG_FS_HZ = 100 Hz. Five
+	 * raw samples per staged value brings the ECG to exactly 100 Hz.
 	 *
 	 * A boxcar rather than a decimating pick-one-in-five, because dropping four
-	 * samples out of five folds everything above the new 49.75 Hz Nyquist back
+	 * samples out of five folds everything above the new 50 Hz Nyquist back
 	 * down, and the bands that land on the 5-30 Hz QRS -- 70-95 Hz, 105-130 Hz,
 	 * 170-195 Hz -- are exactly where the AD8232's broadband noise sits. The
-	 * 5-tap mean nulls at 99.5 Hz and its multiples and holds those bands at least
+	 * 5-tap mean nulls at 100 Hz and its multiples and holds those bands at least
 	 * 8 dB down, 25 dB and better through their middles: a cheap partial
 	 * anti-alias rather than a brick wall, which is the right trade for four adds
 	 * in an ISR. The 50 Hz mains line is only 3.8 dB down and does not need to be:
-	 * it folds to 49.5 Hz, i.e. back to just below Nyquist and still clear of the
-	 * QRS band. None of this touches the STM32's own ECG path -- that one keeps
-	 * the full 497.5 Hz stream in ecg_buffer above.
-	 *
-	 * ponytail: 99.5 Hz against the 100.0 Hz the ESP32 assumes is a 0.5% error in
-	 * the time axis, so a pulse transit time measured across one beat is out by
-	 * under 1 ms -- an order of magnitude below the ~10 ms PTT differences the BP
-	 * model works with, and it does not accumulate because each PTT is measured
-	 * inside a single beat rather than counted from the start of the record.
-	 * Upgrade path: a proper fractional resampler here (or a 500 Hz ECG channel
-	 * with its own counter in the block) if the model turns out to care.
+	 * it lands exactly on the new Nyquist, still clear of the QRS band. None of
+	 * this touches the STM32's own ECG path -- that one keeps the full 500 Hz
+	 * stream in ecg_buffer above.
 	 */
 	{
 		static uint32_t ecg_box_sum = 0;
@@ -1005,7 +996,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 			 * would leave a 1.25x gain on a field documented as raw ADC counts,
 			 * and the ESP32 would scale the R wave it measures amplitudes from.
 			 * UDIV is a handful of cycles on Cortex-M4, once per 5 samples at
-			 * 497.5 Hz, i.e. under 0.01% of the ISR budget. */
+			 * 500 Hz, i.e. under 0.01% of the ISR budget. */
 			mon_ecg_staged = (uint16_t) ((ecg_box_sum + (ECG_WAVE_DECIM / 2U))
 					/ ECG_WAVE_DECIM);
 			mon_ecg_staged_valid = 1U;
@@ -1087,14 +1078,11 @@ _Static_assert(TB_PPG_FS_HZ == DSP_PPG_FS_HZ,
 
 /* The ECG channel in that block is staged by the boxcar in
  * HAL_ADC_ConvCpltCallback, which divides the ADC rate by ECG_WAVE_DECIM. The
- * result has to land within a few percent of the PPG rate the block declares, or
- * the ESP32 is putting two different time axes on one sample slot. The bound is
- * 5% and the real error is 0.5%; it is a range rather than an equality because
- * 497.5 / 5 is not 100 and never will be -- see the ponytail note at the boxcar
- * for what that costs. Integer arithmetic in permille, so it needs no float. */
-_Static_assert(((DSP_ADC_FS_HZ * 1000U) / (ECG_WAVE_DECIM * TB_PPG_FS_HZ)) >= 950U
-		&& ((DSP_ADC_FS_HZ * 1000U) / (ECG_WAVE_DECIM * TB_PPG_FS_HZ)) <= 1050U,
-		"the ECG boxcar no longer lands near TB_PPG_FS_HZ");
+ * result has to equal the PPG rate the block declares, or the ESP32 is putting
+ * two different time axes on one sample slot. Equality since TIM2 ARR became 199
+ * (500 / 5 = 100); it was a 5% range while the ADC ran at 497.5 Hz. */
+_Static_assert(DSP_ADC_FS_HZ == ECG_WAVE_DECIM * TB_PPG_FS_HZ,
+		"the ECG boxcar no longer lands on TB_PPG_FS_HZ");
 
 /* And the block has to be reachable at all. The I2C register pointer is one
  * byte, so a ring size or a base that pushes the tail past 0xFF makes the last

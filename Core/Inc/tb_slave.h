@@ -11,7 +11,7 @@
  * I2C2 register-map slave for the ESP32-S3 master. Wire contract: tb_regs.h.
  *
  * WHY EVERYTHING IS PRE-STAGED: every peripheral interrupt in this firmware
- * sits at preempt priority 0, so the I2C slave ISR cannot preempt the 497.5 Hz
+ * sits at preempt priority 0, so the I2C slave ISR cannot preempt the 500 Hz
  * ADC/DMA ISR -- it waits behind it. If the ISR had to go and read sensor
  * state, it would hold SCL low (clock-stretching) for however long that took,
  * and on the ESP32 side that same bus also drives the touch controller and the

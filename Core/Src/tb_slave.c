@@ -30,7 +30,7 @@ volatile uint32_t mon_bp_writes_rejected = 0;
  * exists to win. The ESP32 reaches its GT911 read -- the first thing that dies
  * on a held bus -- 1333 ms after its own reset, measured. A wedge that starts
  * when the ESP32 resets mid-transfer therefore had 333 ms of margin, and the
- * superloop can be delayed by the 497.5 Hz ADC ISR and by a LoRa transmit, so
+ * superloop can be delayed by the 500 Hz ADC ISR and by a LoRa transmit, so
  * that margin was routinely gone. At 200 ms the bus is free ~1.1 s before the
  * ESP32 looks at it. The floor is a whole transaction: 13 ms. */
 #define TB_SLAVE_STUCK_MS 200U
@@ -312,7 +312,7 @@ void tb_slave_init(void)
     hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
     /*
      * Clock stretching MUST stay enabled (NoStretch DISABLE). This slave is
-     * behind a priority-0 ADC ISR at 497.5 Hz, so an address match can wait a
+     * behind a priority-0 ADC ISR at 500 Hz, so an address match can wait a
      * few microseconds before we service it; with stretching off that becomes
      * corrupt data instead of a brief delay.
      */
@@ -329,7 +329,7 @@ void tb_slave_init(void)
      * disable them in between; that is fine, nothing is listening yet.)
      *
      * Both sit at preempt priority 0, like every other interrupt in this
-     * firmware, so this cannot preempt the 497.5 Hz ADC ISR and can be delayed
+     * firmware, so this cannot preempt the 500 Hz ADC ISR and can be delayed
      * by it by a few microseconds. That is exactly why the transmit buffer is
      * pre-staged: the delay costs a little clock stretching, never wrong data.
      */
