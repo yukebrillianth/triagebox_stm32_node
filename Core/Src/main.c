@@ -174,6 +174,8 @@ _Static_assert(NODE_ID >= 1u && NODE_ID <= LORA_POLL_NODE_MAX,
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static volatile uint16_t mon_adc_min = 0;
+static volatile uint16_t mon_adc_max = 4096;
 // LoRa
 LoRa hlora;
 
@@ -518,7 +520,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-   HAL_Init();
+  HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -632,6 +634,9 @@ int main(void)
 	// the table": the node answers no poll rather than claiming somebody's id.
 	ResolveNodeId();
 	PublishToEsp32();
+
+	mon_adc_min = 0;
+	mon_adc_max = 4096;
   /* USER CODE END 2 */
 
   /* Infinite loop */
